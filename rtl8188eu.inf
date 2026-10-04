@@ -1,0 +1,52 @@
+; rtl8188eu.inf - Phase 3 skeleton (generic USBDevice class, no NDIS yet)
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ManufacturerName%
+CatalogFile = rtl8188eu.cat
+DriverVer   = 10/05/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+rtl8188eu.sys = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTarm64
+
+[Standard.NTarm64]
+%DeviceDesc% = Install, USB\VID_2357&PID_010C
+
+[Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+rtl8188eu.sys
+
+[Install.NT.Services]
+AddService = rtl8188eu, 0x00000002, Service_Install
+
+[Service_Install]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\rtl8188eu.sys
+
+[Install.NT.Wdf]
+KmdfService = rtl8188eu, Wdf_Install
+
+[Wdf_Install]
+KmdfLibraryVersion = $KMDFVERSION$   ; stampinf fills this in VS; or hardcode e.g. 1.33
+
+[Strings]
+ManufacturerName = "rtl8188eu-port"
+DiskName         = "rtl8188eu install disk"
+DeviceDesc       = "RTL8188EUS 802.11n USB (Phase 3 test)"
+ServiceDesc      = "rtl8188eu test driver"

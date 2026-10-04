@@ -1,0 +1,9 @@
+out/
+dist/
+*.binlog
+*.obj
+*.pdb
+*.log
+.vs/
+ARM64/
+x64/

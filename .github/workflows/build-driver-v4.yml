@@ -1,0 +1,94 @@
+# build-driver v4 (compile-first, manual package). If you see "Install WDK" below, this is the OLD file.
+name: build-driver
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md', '**.txt' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Detect WDK
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $tool = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Directory -Filter "WindowsKernelModeDriver10.0" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $bins = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory | Where-Object { $_.Name -like '10.*' }).Name -join ', '
+          Write-Host "::notice title=WDK toolset::$($tool.FullName)"
+          Write-Host "::notice title=Kits bin versions::$bins"
+          if (-not $tool) { Write-Host "::error title=WDK::VS WDK toolset missing on this runner"; exit 1 }
+
+      - name: Compile driver (.sys only, no INF verify/catalog)
+        shell: pwsh
+        run: |
+          $common = @("rtl8188eu.vcxproj","/p:Configuration=Debug","/p:Platform=ARM64","/p:SignMode=Off","/p:SolutionDir=$PWD\","/m","/v:minimal","/flp1:logfile=errors.log;errorsonly")
+          msbuild @common "/t:ClCompile;Link" "/bl:link.binlog"
+          $sys = Get-ChildItem -Recurse -Filter rtl8188eu.sys -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sys) {
+            Write-Host "::warning title=msbuild::Link-only did not produce .sys, trying full Build"
+            msbuild @common "/p:EnableInf2cat=false" "/p:DisableVerification=true" "/bl:full.binlog"
+            $sys = Get-ChildItem -Recurse -Filter rtl8188eu.sys -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $sys) {
+            Get-Content errors.log -ErrorAction SilentlyContinue | Select-Object -Unique -First 15 | ForEach-Object { Write-Host "::error title=msbuild::$_" }
+            exit 1
+          }
+          Write-Host "::notice title=sys::$($sys.FullName) $($sys.Length) bytes"
+
+      - name: Package (stamp INF, catalog, test-sign)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          function Err($t,$m){ Write-Host "::error title=$t::$m" }
+          $sys = Get-ChildItem -Recurse -Filter rtl8188eu.sys | Select-Object -First 1
+          $pkg = Join-Path $PWD "pkg"; New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item $sys.FullName $pkg
+          Copy-Item rtl8188eu.inf $pkg
+          $inf = Join-Path $pkg "rtl8188eu.inf"
+          $bin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Directory | Where-Object { $_.Name -like '10.*' } | Sort-Object Name -Descending | Select-Object -First 1
+          $stamp = @("x86","x64") | ForEach-Object { Join-Path $bin.FullName "$_\stampinf.exe" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          & $stamp -f $inf -d "*" -a arm64 -v "*" -k 1.33 2>&1 | ForEach-Object { Write-Host "stampinf: $_" }
+          (Get-Content $inf -Raw).Replace('$KMDFVERSION$','1.33') | Set-Content $inf -Encoding ASCII
+          Get-Content $inf | Select-String -Pattern 'DriverVer|KmdfLibraryVersion' | ForEach-Object { Write-Host "::notice title=inf::$($_.Line)" }
+          $i2c = @("x86","x64") | ForEach-Object { Join-Path $bin.FullName "$_\Inf2Cat.exe" } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $ok = $false
+          foreach ($os in "10_NI_ARM64","10_VB_ARM64","10_RS5_ARM64") {
+            $out = & $i2c /driver:$pkg /os:$os /verbose 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Host "::notice title=inf2cat::OK with /os:$os"; $ok = $true; break }
+            Err "inf2cat" ("/os:$os exit $LASTEXITCODE :: " + (($out | Where-Object { "$_".Trim() } | Select-Object -Last 6) -join ' | '))
+          }
+          if (-not $ok) { exit 1 }
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=rtl8188eu-woa Test" -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(3)
+          Export-Certificate -Cert $cert -FilePath (Join-Path $pkg "rtl8188eu-test.cer") | Out-Null
+          $signtool = Join-Path $bin.FullName "x64\signtool.exe"
+          foreach ($f in "rtl8188eu.cat","rtl8188eu.sys") {
+            & $signtool sign /fd sha256 /sha1 $cert.Thumbprint /s My (Join-Path $pkg $f) 2>&1 | ForEach-Object { Write-Host "signtool: $_" }
+            if ($LASTEXITCODE -ne 0) { Err "signtool" "failed on $f"; exit 1 }
+          }
+          Get-ChildItem $pkg | ForEach-Object { Write-Host "::notice title=pkg::$($_.Name) $($_.Length)" }
+
+      - name: Collect output
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          if (Test-Path pkg) { Copy-Item pkg\* dist -Force }
+          Get-ChildItem dist | Out-Host
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtl8188eu-arm64-testsigned
+          path: |
+            dist/
+            errors.log
+            *.binlog

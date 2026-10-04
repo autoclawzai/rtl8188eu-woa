@@ -1,0 +1,61 @@
+name: build-driver
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md', '**.txt' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for WDK
+        id: wdk
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $ext = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Filter "WindowsDriver.common.targets" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $kits = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | Where-Object { Test-Path "$($_.FullName)\km\wdf" }
+          Write-Host "VS: $vs"; Write-Host "WDK targets: $($ext.FullName)"; Write-Host "WDK headers: $($kits.FullName)"
+          "have_wdk=$([bool]($ext -and $kits))" >> $env:GITHUB_OUTPUT
+
+      - name: Install WDK (only if runner lacks it)
+        if: steps.wdk.outputs.have_wdk != 'True'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2272234" -OutFile wdksetup.exe
+          Start-Process .\wdksetup.exe -ArgumentList "/quiet /norestart" -Wait
+          # VS integration (WDK.vsix) ships inside the WDK install dir
+          $vsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\VS2022" -Recurse -Filter "WDK.vsix" | Select-Object -First 1
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $vsixInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\resources\app\ServiceHub\Services\Microsoft.VisualStudio.Setup.Service\VSIXInstaller.exe"
+          & $vsixInstaller /q /a $vsix.FullName
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build ARM64 (Debug, test-signed)
+        shell: pwsh
+        run: |
+          msbuild rtl8188eu.vcxproj /p:Configuration=Debug /p:Platform=ARM64 /p:SignMode=TestSign /p:SolutionDir="$PWD\" /m /v:m /bl:build.binlog
+
+      - name: Collect output
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Get-ChildItem -Recurse -Include rtl8188eu.sys,rtl8188eu.inf,rtl8188eu.cat,*.cer,*.pdb -Path . |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' } | Copy-Item -Destination dist -Force
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rtl8188eu-arm64-testsigned
+          path: |
+            dist/
+            build.binlog

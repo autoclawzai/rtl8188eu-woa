@@ -13,35 +13,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check for WDK
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Detect WDK (VS toolset + headers)
         id: wdk
         shell: pwsh
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $ext = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Filter "WindowsDriver.common.targets" -ErrorAction SilentlyContinue | Select-Object -First 1
-          $kits = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | Where-Object { Test-Path "$($_.FullName)\km\wdf" }
-          Write-Host "VS: $vs"; Write-Host "WDK targets: $($ext.FullName)"; Write-Host "WDK headers: $($kits.FullName)"
-          "have_wdk=$([bool]($ext -and $kits))" >> $env:GITHUB_OUTPUT
+          $tool = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Directory -Filter "WindowsKernelModeDriver10.0" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $inc  = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path "$($_.FullName)\km\wdf" }
+          $arm  = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | ForEach-Object { Test-Path "$($_.FullName)\lib\arm64" }
+          Write-Host "::notice title=VS::$vs"
+          Write-Host "::notice title=WDK toolset::$($tool.FullName)"
+          Write-Host "::notice title=WDK headers::$($inc.Name -join ', ')"
+          Write-Host "::notice title=MSVC ARM64 libs::$($arm -join ',')"
+          "have=$([bool]($tool -and $inc))" >> $env:GITHUB_OUTPUT
 
-      - name: Install WDK (only if runner lacks it)
-        if: steps.wdk.outputs.have_wdk != 'True'
+      - name: Install WDK via Chocolatey (fallback, only if missing)
+        if: steps.wdk.outputs.have != 'True'
         shell: pwsh
+        continue-on-error: true
         run: |
-          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2272234" -OutFile wdksetup.exe
-          Start-Process .\wdksetup.exe -ArgumentList "/quiet /norestart" -Wait
-          # VS integration (WDK.vsix) ships inside the WDK install dir
-          $vsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix\VS2022" -Recurse -Filter "WDK.vsix" | Select-Object -First 1
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $vsixInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\resources\app\ServiceHub\Services\Microsoft.VisualStudio.Setup.Service\VSIXInstaller.exe"
-          & $vsixInstaller /q /a $vsix.FullName
-
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v2
+          choco install windowsdriverkit11 -y --no-progress
+          $LASTEXITCODE | Out-Host
 
       - name: Build ARM64 (Debug, test-signed)
         shell: pwsh
         run: |
-          msbuild rtl8188eu.vcxproj /p:Configuration=Debug /p:Platform=ARM64 /p:SignMode=TestSign /p:SolutionDir="$PWD\" /m /v:m /bl:build.binlog
+          msbuild rtl8188eu.vcxproj /p:Configuration=Debug /p:Platform=ARM64 /p:SignMode=TestSign "/p:SolutionDir=$PWD\" /m /v:minimal /bl:build.binlog /flp:"logfile=build.log;verbosity=minimal" /flp1:"logfile=errors.log;errorsonly"
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            Get-Content errors.log -ErrorAction SilentlyContinue | Select-Object -Unique -First 15 | ForEach-Object { Write-Host "::error title=msbuild::$_" }
+          }
+          exit $code
 
       - name: Collect output
         if: always()
@@ -49,7 +54,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Get-ChildItem -Recurse -Include rtl8188eu.sys,rtl8188eu.inf,rtl8188eu.cat,*.cer,*.pdb -Path . |
-            Where-Object { $_.FullName -notmatch '\\\.git\\' } | Copy-Item -Destination dist -Force
+            Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\dist\\' } | Copy-Item -Destination dist -Force
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4
@@ -58,4 +63,6 @@ jobs:
           name: rtl8188eu-arm64-testsigned
           path: |
             dist/
+            build.log
+            errors.log
             build.binlog

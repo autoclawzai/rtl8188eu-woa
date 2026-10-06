@@ -7,6 +7,7 @@
  *   2. EFUSE read + logical-map parse  -> MAC address
  *   3. power-on sequence
  *   4. firmware download (rtl8188eufw.bin rev 28.0) + wait for WINTINI_RDY
+ *   5. MAC/BB/AGC/RF register tables replayed from the capture (507 writes) + read-back check
  *
  * Progress/results are written to the device registry key so they can be read
  * without a debugger:
@@ -25,6 +26,7 @@
 #include <ntstrsafe.h>
 
 #include "fwdata.h"
+#include "inittab.h"
 
 #define TAG "rtl8188eu: "
 #define LOG(fmt, ...) \
@@ -324,6 +326,44 @@ static NTSTATUS Rtl_DownloadFirmware(PDEVICE_CONTEXT c, ULONG *reg80, ULONG *pol
     return STATUS_IO_TIMEOUT;
 }
 
+/* ---- MAC / baseband / AGC / RF init tables (replayed from capture) ------ */
+
+static NTSTATUS Rtl_ReplayInit(PDEVICE_CONTEXT c, ULONG *done)
+{
+    ULONG i;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    for (i = 0; i < RTL_INIT_COUNT; i++) {
+        const RTL_INIT_OP *op = &g_InitTab[i];
+        switch (op->Len) {
+        case 1:  st = Rtl_Write8 (c, op->Reg, (UCHAR)op->Val);  break;
+        case 2:  st = Rtl_Write16(c, op->Reg, (USHORT)op->Val); break;
+        default: st = Rtl_Write32(c, op->Reg, op->Val);         break;
+        }
+        if (!NT_SUCCESS(st)) { *done = i; return st; }
+    }
+    *done = i;
+    return STATUS_SUCCESS;
+}
+
+/* Read back every 32-bit baseband register that the table wrote exactly once
+ * and compare.  Informational: some bits may legitimately differ. */
+static NTSTATUS Rtl_VerifyInit(PDEVICE_CONTEXT c, ULONG *mismatch, ULONG *firstReg, ULONG *firstGot)
+{
+    ULONG i, v;
+    NTSTATUS st;
+
+    *mismatch = 0; *firstReg = 0; *firstGot = 0;
+    for (i = 0; i < RTL_VERIFY_COUNT; i++) {
+        CHK(Rtl_Read32(c, g_VerifyTab[i].Reg, &v));
+        if (v != g_VerifyTab[i].Val) {
+            if (*mismatch == 0) { *firstReg = g_VerifyTab[i].Reg; *firstGot = v; }
+            (*mismatch)++;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 /* ---- driver ------------------------------------------------------------ */
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
@@ -356,6 +396,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     NTSTATUS st;
     UCHAR i, npipes;
     ULONG sysCfg = 0, rawLen = 0, reg80 = 0, polls = 0;
+    ULONG initDone = 0, vMismatch = 0, vFirstReg = 0, vFirstGot = 0;
     USHORT r9346 = 0;
     WCHAR nm[32];
 
@@ -441,6 +482,24 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
             RegLog(dev, L"Log_Fw_Polls", polls);
             LOG("firmware st=0x%08x reg80=0x%08x polls=%lu", st, reg80, polls);
             if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 8);   /* firmware running (WINTINI_RDY) */
+        }
+    }
+
+    /* ---- Phase 3c: MAC/BB/AGC/RF table replay (only if firmware is up) */
+    if (NT_SUCCESS(st)) {
+        st = Rtl_ReplayInit(ctx, &initDone);
+        RegLog(dev, L"Log_Init_Status", (ULONG)st);
+        RegLog(dev, L"Log_Init_Done", initDone);
+        LOG("init replay st=0x%08x done=%lu/%u", st, initDone, (unsigned)RTL_INIT_COUNT);
+        if (NT_SUCCESS(st)) {
+            RegLog(dev, L"Log_Stage", 9);   /* tables written */
+            st = Rtl_VerifyInit(ctx, &vMismatch, &vFirstReg, &vFirstGot);
+            RegLog(dev, L"Log_Verify_Status", (ULONG)st);
+            RegLog(dev, L"Log_Verify_Count", RTL_VERIFY_COUNT);
+            RegLog(dev, L"Log_Verify_Mismatch", vMismatch);
+            RegLog(dev, L"Log_Verify_FirstReg", vFirstReg);
+            RegLog(dev, L"Log_Verify_FirstGot", vFirstGot);
+            if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 10);   /* verify finished */
         }
     }
 

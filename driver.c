@@ -15,6 +15,7 @@
 #include <usb.h>
 #include <usbdlib.h>
 #include <wdfusb.h>
+#include <ntstrsafe.h>
 
 #define TAG "rtl8188eu: "
 #define LOG(fmt, ...) \
@@ -75,6 +76,19 @@ NTSTATUS Rtl_Write8 (PDEVICE_CONTEXT c, USHORT r, UCHAR  v) { return RtlCtrl(c, 
 NTSTATUS Rtl_Write16(PDEVICE_CONTEXT c, USHORT r, USHORT v) { return RtlCtrl(c, FALSE, r, &v, 2); }
 NTSTATUS Rtl_Write32(PDEVICE_CONTEXT c, USHORT r, ULONG  v) { return RtlCtrl(c, FALSE, r, &v, 4); }
 
+/* ---- registry log: HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_2357&PID_010C\<serial>\Device Parameters\Log_* ----
+ * Lets us read driver progress from PowerShell without DebugView/WinDbg. */
+static VOID RegLog(WDFDEVICE dev, PCWSTR name, ULONG value)
+{
+    WDFKEY key;
+    UNICODE_STRING nm;
+    if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(dev, PLUGPLAY_REGKEY_DEVICE, KEY_WRITE,
+                                             WDF_NO_OBJECT_ATTRIBUTES, &key))) return;
+    RtlInitUnicodeString(&nm, name);
+    (VOID)WdfRegistryAssignULong(key, &nm, value);
+    WdfRegistryClose(key);
+}
+
 /* ---- driver ------------------------------------------------------------ */
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
@@ -108,20 +122,28 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     UCHAR i, npipes;
     ULONG sysCfg = 0;
     USHORT r9346 = 0;
+    WCHAR nm[32];
 
     UNREFERENCED_PARAMETER(res);
     UNREFERENCED_PARAMETER(resTr);
 
+    RegLog(dev, L"Log_Stage", 1);   /* entered PrepareHardware */
+
     WDF_USB_DEVICE_CREATE_CONFIG_INIT(&ucfg, USBD_CLIENT_CONTRACT_VERSION_602);
     st = WdfUsbTargetDeviceCreateWithParameters(dev, &ucfg, WDF_NO_OBJECT_ATTRIBUTES, &ctx->UsbDevice);
+    RegLog(dev, L"Log_UsbDeviceCreate", (ULONG)st);
     if (!NT_SUCCESS(st)) { LOG("UsbDeviceCreate failed 0x%08x", st); return st; }
+    RegLog(dev, L"Log_Stage", 2);   /* USB device object ok */
 
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS_INIT_SINGLE_INTERFACE(&sel);
     st = WdfUsbTargetDeviceSelectConfig(ctx->UsbDevice, WDF_NO_OBJECT_ATTRIBUTES, &sel);
+    RegLog(dev, L"Log_SelectConfig", (ULONG)st);
     if (!NT_SUCCESS(st)) { LOG("SelectConfig failed 0x%08x", st); return st; }
+    RegLog(dev, L"Log_Stage", 3);   /* configuration selected */
 
     ctx->UsbInterface = sel.Types.SingleInterface.ConfiguredUsbInterface;
     npipes = WdfUsbInterfaceGetNumConfiguredPipes(ctx->UsbInterface);
+    RegLog(dev, L"Log_NumPipes", npipes);
     LOG("configured pipes: %u", npipes);
 
     for (i = 0; i < npipes; i++) {
@@ -132,6 +154,10 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         LOG("  pipe %u: addr=0x%02x type=%d maxpkt=%u",
             i, pi.EndpointAddress, (int)pi.PipeType, pi.MaximumPacketSize);
 
+        /* Log_PipeN = addr | (type << 8) | (maxpkt << 16)   type: 2=bulk */
+        if (NT_SUCCESS(RtlStringCchPrintfW(nm, 32, L"Log_Pipe%u", (ULONG)i)))
+            RegLog(dev, nm, (ULONG)pi.EndpointAddress | ((ULONG)pi.PipeType << 8) | ((ULONG)pi.MaximumPacketSize << 16));
+
         if (pi.PipeType != WdfUsbPipeTypeBulk) continue;
         if (WdfUsbTargetPipeIsInEndpoint(pipe)) {
             ctx->BulkIn = pipe;
@@ -139,13 +165,22 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
             ctx->BulkOut[ctx->BulkOutCount++] = pipe;
         }
     }
+    RegLog(dev, L"Log_BulkIn", ctx->BulkIn ? 1 : 0);
+    RegLog(dev, L"Log_BulkOutCount", ctx->BulkOutCount);
     LOG("bulk in=%p, bulk out count=%lu (expect 1 in, 2 out)", ctx->BulkIn, ctx->BulkOutCount);
+    RegLog(dev, L"Log_Stage", 4);   /* pipes enumerated */
 
     /* ---- Milestone: register reads. Expect SYS_CFG=0x24403735 (from capture) */
     st = Rtl_Read32(ctx, REG_SYS_CFG, &sysCfg);
+    RegLog(dev, L"Log_SysCfg_Status", (ULONG)st);
+    RegLog(dev, L"Log_SysCfg_Value", sysCfg);
     LOG("read SYS_CFG(0x00F0) st=0x%08x val=0x%08x", st, sysCfg);
+
     st = Rtl_Read16(ctx, REG_9346CR, &r9346);
+    RegLog(dev, L"Log_Reg0A_Status", (ULONG)st);
+    RegLog(dev, L"Log_Reg0A_Value", r9346);
     LOG("read 0x000A st=0x%08x val=0x%04x", st, r9346);
 
+    RegLog(dev, L"Log_Stage", 5);   /* finished, returning success */
     return STATUS_SUCCESS;   /* load anyway so we can inspect logs */
 }

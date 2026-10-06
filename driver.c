@@ -1,13 +1,20 @@
 /*
- * rtl8188eu - Phase 3 skeleton (KMDF USB, ARM64)
+ * rtl8188eu - Phase 3b (KMDF USB, ARM64)
  *
- * Milestone: bind to USB\VID_2357&PID_010C, select config, enumerate bulk
- * pipes, issue Realtek vendor register reads (bRequest 0x05) and log them.
- * Output goes to DbgPrintEx (view with DebugView -> Capture Kernel, or WinDbg).
+ * Steps implemented (all verified byte-for-byte against a usbmon capture of
+ * the Linux rtl8xxxu driver talking to the same adapter):
+ *   1. bind, select config, enumerate bulk pipes
+ *   2. EFUSE read + logical-map parse  -> MAC address
+ *   3. power-on sequence
+ *   4. firmware download (rtl8188eufw.bin rev 28.0) + wait for WINTINI_RDY
  *
- * Register protocol (verified from usbmon capture of rtl8xxxu):
- *   read : bmRequestType 0xC0, bRequest 0x05, wValue = reg, wIndex = 0, wLength = 1/2/4
- *   write: bmRequestType 0x40, bRequest 0x05, wValue = reg, wIndex = 0, wLength = 1/2/4
+ * Progress/results are written to the device registry key so they can be read
+ * without a debugger:
+ *   HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_2357&PID_010C\<serial>\Device Parameters\Log_*
+ *
+ * Register protocol:
+ *   read : bmRequestType 0xC0, bRequest 0x05, wValue = reg, wIndex = 0, wLength = 1..196
+ *   write: bmRequestType 0x40, bRequest 0x05, wValue = reg, wIndex = 0, wLength = 1..196
  *   little-endian data.
  */
 #include <ntddk.h>
@@ -17,13 +24,39 @@
 #include <wdfusb.h>
 #include <ntstrsafe.h>
 
+#include "fwdata.h"
+
 #define TAG "rtl8188eu: "
 #define LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, TAG fmt "\n", __VA_ARGS__)
 
+#define CHK(expr) do { st = (expr); if (!NT_SUCCESS(st)) return st; } while (0)
+
 #define RTL_VENDOR_REQ      0x05
+#define REG_SYS_FUNC        0x0002   /* 16-bit, BIT10 = 8051 enable      */
+#define REG_APS_FSMCO       0x0004   /* 32-bit, BIT8  = APFM_ONMAC       */
+#define REG_EFUSE_CTRL      0x0030
+#define REG_MCU_FW_DL       0x0080   /* 32-bit; +2 = page select         */
+#define REG_EFUSE_ACCESS    0x00CF
 #define REG_SYS_CFG         0x00F0   /* 32-bit; capture showed 0x24403735 */
 #define REG_9346CR          0x000A   /* 16-bit; capture showed 0x0020     */
+
+#define MCU_FW_DL_ENABLE    0x01
+#define MCU_FW_DL_READY     0x02
+#define MCU_FW_DL_CSUM_OK   0x04
+#define MCU_WINTINI_RDY     0x40
+#define MCU_FW_RAM_SEL      0x80
+
+#define FW_HDR_LEN          32
+#define FW_SIG_88E          0x88E1
+#define FW_PAGE_SIZE        4096
+#define FW_BLOCK            196
+#define FW_BASE             0x1000
+
+#define EFUSE_REAL_LEN      512
+#define EFUSE_MAP_LEN       512
+#define EFUSE_MAC_ADDR_88EU 0xD7
+
 #define MAX_BULK_OUT        3
 
 typedef struct _DEVICE_CONTEXT {
@@ -32,6 +65,7 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      BulkIn;
     WDFUSBPIPE      BulkOut[MAX_BULK_OUT];
     ULONG           BulkOutCount;
+    UCHAR           EfuseMap[EFUSE_MAP_LEN];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
@@ -69,15 +103,38 @@ static NTSTATUS RtlCtrl(PDEVICE_CONTEXT ctx, BOOLEAN read, USHORT reg,
     return st;
 }
 
-NTSTATUS Rtl_Read8 (PDEVICE_CONTEXT c, USHORT r, UCHAR  *v) { return RtlCtrl(c, TRUE,  r, v, 1); }
-NTSTATUS Rtl_Read16(PDEVICE_CONTEXT c, USHORT r, USHORT *v) { return RtlCtrl(c, TRUE,  r, v, 2); }
-NTSTATUS Rtl_Read32(PDEVICE_CONTEXT c, USHORT r, ULONG  *v) { return RtlCtrl(c, TRUE,  r, v, 4); }
-NTSTATUS Rtl_Write8 (PDEVICE_CONTEXT c, USHORT r, UCHAR  v) { return RtlCtrl(c, FALSE, r, &v, 1); }
-NTSTATUS Rtl_Write16(PDEVICE_CONTEXT c, USHORT r, USHORT v) { return RtlCtrl(c, FALSE, r, &v, 2); }
-NTSTATUS Rtl_Write32(PDEVICE_CONTEXT c, USHORT r, ULONG  v) { return RtlCtrl(c, FALSE, r, &v, 4); }
+static NTSTATUS Rtl_Read8 (PDEVICE_CONTEXT c, USHORT r, UCHAR  *v) { return RtlCtrl(c, TRUE,  r, v, 1); }
+static NTSTATUS Rtl_Read16(PDEVICE_CONTEXT c, USHORT r, USHORT *v) { return RtlCtrl(c, TRUE,  r, v, 2); }
+static NTSTATUS Rtl_Read32(PDEVICE_CONTEXT c, USHORT r, ULONG  *v) { return RtlCtrl(c, TRUE,  r, v, 4); }
+static NTSTATUS Rtl_Write8 (PDEVICE_CONTEXT c, USHORT r, UCHAR  v) { return RtlCtrl(c, FALSE, r, &v, 1); }
+static NTSTATUS Rtl_Write16(PDEVICE_CONTEXT c, USHORT r, USHORT v) { return RtlCtrl(c, FALSE, r, &v, 2); }
+static NTSTATUS Rtl_Write32(PDEVICE_CONTEXT c, USHORT r, ULONG  v) { return RtlCtrl(c, FALSE, r, &v, 4); }
 
-/* ---- registry log: HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_2357&PID_010C\<serial>\Device Parameters\Log_* ----
- * Lets us read driver progress from PowerShell without DebugView/WinDbg. */
+/* read-modify-write: v = (v & ~clr) | set */
+static NTSTATUS Rmw8(PDEVICE_CONTEXT c, USHORT r, UCHAR clr, UCHAR set)
+{
+    UCHAR v; NTSTATUS st;
+    CHK(Rtl_Read8(c, r, &v));
+    v = (UCHAR)((v & (UCHAR)~clr) | set);
+    return Rtl_Write8(c, r, v);
+}
+static NTSTATUS Rmw16(PDEVICE_CONTEXT c, USHORT r, USHORT clr, USHORT set)
+{
+    USHORT v; NTSTATUS st;
+    CHK(Rtl_Read16(c, r, &v));
+    v = (USHORT)((v & (USHORT)~clr) | set);
+    return Rtl_Write16(c, r, v);
+}
+static NTSTATUS Rmw32(PDEVICE_CONTEXT c, USHORT r, ULONG clr, ULONG set)
+{
+    ULONG v; NTSTATUS st;
+    CHK(Rtl_Read32(c, r, &v));
+    v = (v & ~clr) | set;
+    return Rtl_Write32(c, r, v);
+}
+
+/* ---- registry log: ...\Device Parameters\Log_* -------------------------- */
+
 static VOID RegLog(WDFDEVICE dev, PCWSTR name, ULONG value)
 {
     WDFKEY key;
@@ -87,6 +144,184 @@ static VOID RegLog(WDFDEVICE dev, PCWSTR name, ULONG value)
     RtlInitUnicodeString(&nm, name);
     (VOID)WdfRegistryAssignULong(key, &nm, value);
     WdfRegistryClose(key);
+}
+
+/* ---- EFUSE ------------------------------------------------------------- */
+
+static NTSTATUS EfuseRead8(PDEVICE_CONTEXT c, USHORT addr, UCHAR *out)
+{
+    NTSTATUS st;
+    UCHAR v8;
+    ULONG v32 = 0;
+    int i;
+
+    CHK(Rtl_Write8(c, REG_EFUSE_CTRL + 1, (UCHAR)(addr & 0xFF)));
+    CHK(Rtl_Read8 (c, REG_EFUSE_CTRL + 2, &v8));
+    v8 = (UCHAR)((v8 & 0xFC) | ((addr >> 8) & 0x03));
+    CHK(Rtl_Write8(c, REG_EFUSE_CTRL + 2, v8));
+    CHK(Rtl_Read8 (c, REG_EFUSE_CTRL + 3, &v8));
+    CHK(Rtl_Write8(c, REG_EFUSE_CTRL + 3, (UCHAR)(v8 & 0x7F)));   /* clear ready flag */
+
+    for (i = 0; i < 100; i++) {
+        CHK(Rtl_Read32(c, REG_EFUSE_CTRL, &v32));
+        if (v32 & 0x80000000) { *out = (UCHAR)(v32 & 0xFF); return STATUS_SUCCESS; }
+    }
+    return STATUS_IO_TIMEOUT;
+}
+
+/* Realtek EFUSE format: header byte = (offset<<4 | wordmask) or extended
+ * header (low 5 bits 0x0F).  A SET bit in wordmask means the word is NOT
+ * present.  Verified against capture: MAC at logical 0xD7 = 10:27:f5:99:50:56 */
+static NTSTATUS EfuseParse(PDEVICE_CONTEXT c, ULONG *rawLen)
+{
+    NTSTATUS st;
+    USHORT i = 0;
+    UCHAR hdr, h2, mask, b0, b1;
+    USHORT offset;
+    int w;
+
+    RtlFillMemory(c->EfuseMap, EFUSE_MAP_LEN, 0xFF);
+
+    while (i < EFUSE_REAL_LEN) {
+        CHK(EfuseRead8(c, i++, &hdr));
+        if (hdr == 0xFF) break;
+
+        if ((hdr & 0x1F) == 0x0F) {
+            CHK(EfuseRead8(c, i++, &h2));
+            if (h2 == 0xFF) break;
+            offset = (USHORT)(((hdr & 0xE0) >> 5) | ((h2 & 0xF0) >> 1));
+            mask   = (UCHAR)(h2 & 0x0F);
+        } else {
+            offset = (USHORT)(hdr >> 4);
+            mask   = (UCHAR)(hdr & 0x0F);
+        }
+
+        for (w = 0; w < 4; w++) {
+            if (!(mask & (1 << w))) {
+                CHK(EfuseRead8(c, i++, &b0));
+                CHK(EfuseRead8(c, i++, &b1));
+                if ((ULONG)offset * 8 + w * 2 + 1 < EFUSE_MAP_LEN) {
+                    c->EfuseMap[offset * 8 + w * 2]     = b0;
+                    c->EfuseMap[offset * 8 + w * 2 + 1] = b1;
+                }
+            }
+        }
+    }
+    *rawLen = i;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS Rtl_ReadEfuse(PDEVICE_CONTEXT c, ULONG *rawLen)
+{
+    NTSTATUS st, st2;
+    CHK(Rtl_Write8(c, REG_EFUSE_ACCESS, 0x69));      /* enable */
+    st = EfuseParse(c, rawLen);
+    st2 = Rtl_Write8(c, REG_EFUSE_ACCESS, 0x00);     /* always disable again */
+    return NT_SUCCESS(st) ? st2 : st;
+}
+
+/* ---- power on (sequence taken 1:1 from the capture) --------------------- */
+
+static NTSTATUS Rtl_PowerOn(PDEVICE_CONTEXT c)
+{
+    NTSTATUS st;
+    UCHAR t8;
+    USHORT t16;
+    ULONG t32;
+    int i;
+
+    CHK(Rtl_Read8 (c, 0x0100, &t8));
+    CHK(Rtl_Read16(c, 0x0008, &t16));
+    CHK(Rmw16(c, 0x0004, 0, 0));
+    CHK(Rtl_Read32(c, REG_APS_FSMCO, &t32));
+    CHK(Rmw8 (c, REG_SYS_FUNC, 0, 0));
+    CHK(Rmw32(c, 0x0024, 0, 0x00800000));
+    CHK(Rmw16(c, 0x0004, 0, 0));
+    CHK(Rmw16(c, 0x0004, 0, 0));
+    CHK(Rmw32(c, REG_APS_FSMCO, 0, 0x00000100));      /* APFM_ONMAC: start MAC power-on */
+
+    for (i = 0; i < 500; i++) {                       /* wait for hardware to clear it  */
+        CHK(Rtl_Read32(c, REG_APS_FSMCO, &t32));
+        if (!(t32 & 0x00000100)) break;
+    }
+    if (i == 500) return STATUS_IO_TIMEOUT;
+
+    CHK(Rmw8(c, 0x0023, 0, 0));
+    CHK(Rtl_Write16(c, 0x0100, 0x063F));              /* CR: enable MAC/DMA blocks */
+    CHK(Rtl_Write32(c, 0x0214, 0x0000001C));
+    CHK(Rtl_Write32(c, 0x0200, 0x80630029));
+    CHK(Rmw16(c, 0x010C, 0, 0xFAF0));
+    CHK(Rtl_Write16(c, 0x0116, 0x25FF));
+    CHK(Rmw8 (c, 0x0003, 0, 0));
+    CHK(Rmw16(c, REG_SYS_FUNC, 0, 0));
+    return STATUS_SUCCESS;
+}
+
+/* ---- firmware download -------------------------------------------------- */
+
+static NTSTATUS Reset8051(PDEVICE_CONTEXT c)
+{
+    USHORT v; NTSTATUS st;
+    CHK(Rtl_Read16(c, REG_SYS_FUNC, &v));
+    CHK(Rtl_Write16(c, REG_SYS_FUNC, (USHORT)(v & ~0x0400)));
+    return Rtl_Write16(c, REG_SYS_FUNC, (USHORT)(v | 0x0400));
+}
+
+static NTSTATUS Rtl_DownloadFirmware(PDEVICE_CONTEXT c, ULONG *reg80, ULONG *polls)
+{
+    const UCHAR *fw = g_Rtl8188euFw + FW_HDR_LEN;
+    ULONG fwLen = RTL8188EU_FW_LEN - FW_HDR_LEN;
+    ULONG page, pages, off, left, v32 = 0;
+    USHORT sz;
+    UCHAR buf[FW_BLOCK];
+    UCHAR v8;
+    NTSTATUS st;
+    int i;
+
+    /* sanity: header signature + ram code size must match what we ship */
+    if ((USHORT)(g_Rtl8188euFw[0] | (g_Rtl8188euFw[1] << 8)) != FW_SIG_88E) return STATUS_INVALID_IMAGE_FORMAT;
+    if ((USHORT)(g_Rtl8188euFw[12] | (g_Rtl8188euFw[13] << 8)) != fwLen)    return STATUS_INVALID_IMAGE_FORMAT;
+
+    CHK(Rtl_Read8(c, REG_MCU_FW_DL, &v8));
+    if (v8 & MCU_FW_RAM_SEL) {                        /* firmware already running -> reset 8051 */
+        CHK(Rtl_Write8(c, REG_MCU_FW_DL, 0x00));
+        CHK(Reset8051(c));
+    }
+
+    CHK(Rmw8 (c, REG_MCU_FW_DL, 0, MCU_FW_DL_ENABLE));
+    CHK(Rmw32(c, REG_MCU_FW_DL, 0x00080000, 0));
+    CHK(Rmw8 (c, REG_MCU_FW_DL, 0, MCU_FW_DL_CSUM_OK));  /* reset checksum report */
+
+    pages = (fwLen + FW_PAGE_SIZE - 1) / FW_PAGE_SIZE;
+    for (page = 0; page < pages; page++) {
+        CHK(Rmw8(c, REG_MCU_FW_DL + 2, 0x07, (UCHAR)page));
+        left = fwLen - page * FW_PAGE_SIZE;
+        if (left > FW_PAGE_SIZE) left = FW_PAGE_SIZE;
+        off = 0;
+        while (left) {
+            sz = (left >= FW_BLOCK) ? (USHORT)FW_BLOCK : (USHORT)left;
+            RtlCopyMemory(buf, fw + page * FW_PAGE_SIZE + off, sz);
+            CHK(RtlCtrl(c, FALSE, (USHORT)(FW_BASE + off), buf, sz));
+            off += sz;
+            left -= sz;
+        }
+    }
+
+    CHK(Rmw16(c, REG_MCU_FW_DL, MCU_FW_DL_ENABLE, 0));   /* download done */
+    CHK(Rtl_Read32(c, REG_MCU_FW_DL, &v32));
+    *reg80 = v32;
+    if (!(v32 & MCU_FW_DL_CSUM_OK)) return STATUS_DATA_ERROR;   /* checksum failed */
+
+    CHK(Rmw32(c, REG_MCU_FW_DL, MCU_WINTINI_RDY, MCU_FW_DL_READY));
+    CHK(Reset8051(c));                                   /* start the firmware */
+
+    for (i = 0; i < 500; i++) {
+        CHK(Rtl_Read32(c, REG_MCU_FW_DL, &v32));
+        *reg80 = v32;
+        *polls = (ULONG)i;
+        if (v32 & MCU_WINTINI_RDY) return STATUS_SUCCESS;
+    }
+    return STATUS_IO_TIMEOUT;
 }
 
 /* ---- driver ------------------------------------------------------------ */
@@ -120,7 +355,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS sel;
     NTSTATUS st;
     UCHAR i, npipes;
-    ULONG sysCfg = 0;
+    ULONG sysCfg = 0, rawLen = 0, reg80 = 0, polls = 0;
     USHORT r9346 = 0;
     WCHAR nm[32];
 
@@ -154,7 +389,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         LOG("  pipe %u: addr=0x%02x type=%d maxpkt=%u",
             i, pi.EndpointAddress, (int)pi.PipeType, pi.MaximumPacketSize);
 
-        /* Log_PipeN = addr | (type << 8) | (maxpkt << 16)   type: 2=bulk */
+        /* Log_PipeN = addr | (type << 8) | (maxpkt << 16)   type: 3=bulk */
         if (NT_SUCCESS(RtlStringCchPrintfW(nm, 32, L"Log_Pipe%u", (ULONG)i)))
             RegLog(dev, nm, (ULONG)pi.EndpointAddress | ((ULONG)pi.PipeType << 8) | ((ULONG)pi.MaximumPacketSize << 16));
 
@@ -170,7 +405,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     LOG("bulk in=%p, bulk out count=%lu (expect 1 in, 2 out)", ctx->BulkIn, ctx->BulkOutCount);
     RegLog(dev, L"Log_Stage", 4);   /* pipes enumerated */
 
-    /* ---- Milestone: register reads. Expect SYS_CFG=0x24403735 (from capture) */
+    /* ---- Phase 3a: register reads. Expect SYS_CFG=0x24403735 (608188213) */
     st = Rtl_Read32(ctx, REG_SYS_CFG, &sysCfg);
     RegLog(dev, L"Log_SysCfg_Status", (ULONG)st);
     RegLog(dev, L"Log_SysCfg_Value", sysCfg);
@@ -179,8 +414,35 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     st = Rtl_Read16(ctx, REG_9346CR, &r9346);
     RegLog(dev, L"Log_Reg0A_Status", (ULONG)st);
     RegLog(dev, L"Log_Reg0A_Value", r9346);
-    LOG("read 0x000A st=0x%08x val=0x%04x", st, r9346);
+    RegLog(dev, L"Log_Stage", 5);   /* register access works */
 
-    RegLog(dev, L"Log_Stage", 5);   /* finished, returning success */
+    /* ---- Phase 3b-1: EFUSE -> MAC address. Expect 10:27:f5:99:50:56 for this adapter.
+     * Log_MacA = b0 | b1<<8 | b2<<16 | b3<<24 (0x99f52710), Log_MacB = b4 | b5<<8 (0x5650) */
+    st = Rtl_ReadEfuse(ctx, &rawLen);
+    RegLog(dev, L"Log_Efuse_Status", (ULONG)st);
+    RegLog(dev, L"Log_Efuse_RawLen", rawLen);
+    if (NT_SUCCESS(st)) {
+        const UCHAR *m = ctx->EfuseMap + EFUSE_MAC_ADDR_88EU;
+        RegLog(dev, L"Log_MacA", (ULONG)m[0] | ((ULONG)m[1] << 8) | ((ULONG)m[2] << 16) | ((ULONG)m[3] << 24));
+        RegLog(dev, L"Log_MacB", (ULONG)m[4] | ((ULONG)m[5] << 8));
+        LOG("EFUSE ok, raw=%lu MAC=%02x:%02x:%02x:%02x:%02x:%02x", rawLen, m[0], m[1], m[2], m[3], m[4], m[5]);
+        RegLog(dev, L"Log_Stage", 6);   /* efuse parsed */
+    }
+
+    /* ---- Phase 3b-2: power on + firmware download */
+    if (NT_SUCCESS(st)) {
+        st = Rtl_PowerOn(ctx);
+        RegLog(dev, L"Log_PowerOn_Status", (ULONG)st);
+        if (NT_SUCCESS(st)) {
+            RegLog(dev, L"Log_Stage", 7);   /* power on done */
+            st = Rtl_DownloadFirmware(ctx, &reg80, &polls);
+            RegLog(dev, L"Log_Fw_Status", (ULONG)st);
+            RegLog(dev, L"Log_Fw_Reg80", reg80);
+            RegLog(dev, L"Log_Fw_Polls", polls);
+            LOG("firmware st=0x%08x reg80=0x%08x polls=%lu", st, reg80, polls);
+            if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 8);   /* firmware running (WINTINI_RDY) */
+        }
+    }
+
     return STATUS_SUCCESS;   /* load anyway so we can inspect logs */
 }

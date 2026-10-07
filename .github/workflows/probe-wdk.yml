@@ -7,7 +7,7 @@ jobs:
   probe:
     runs-on: windows-2022
     steps:
-      - name: IDs and generated TLV functions
+      - name: Signatures
         shell: pwsh
         run: |
           $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
@@ -16,14 +16,20 @@ jobs:
             $i = 0
             while ($text.Length -gt 0 -and $i -lt 9) {
               $n = [Math]::Min(3600, $text.Length)
-              Write-Host "::notice title=$title#$i::$($text.Substring(0,$n))"
+              Write-Host "::notice title=$title#$i::$($text.Substring(0,$n).Replace("`n",'%0A'))"
               $text = $text.Substring($n); $i++
             }
           }
-          # message ids: lines with #define ... OID_WDI / WDI_ message id style
-          $intf = Get-Content "$inc\dot11wificxintf.h" -Raw
-          $m = [regex]::Matches($intf, '#define\s+(OID_WDI_[A-Z0-9_]+)\s+(\S+)') | ForEach-Object { $_.Groups[1].Value.Replace('OID_WDI_','') + '=' + $_.Groups[2].Value }
-          Emit "ids" (($m | Select-Object -Unique) -join ',')
-          $gen = Get-Content "$inc\wlan\2.0\TlvGenerated_.hpp" -Raw
-          $g = [regex]::Matches($gen, '\b(Parse|Generate)(Wdi[A-Za-z0-9_]+)\s*\(') | ForEach-Object { $_.Groups[1].Value.Substring(0,1) + $_.Groups[2].Value.Replace('Wdi','') } | Select-Object -Unique
-          Emit "gen" ($g -join ',')
+          function Ctx($file, $pattern, $after, $max) {
+            $lines = Get-Content $file
+            $out = New-Object System.Collections.Generic.List[string]
+            for ($k=0; $k -lt $lines.Count; $k++) {
+              if ($lines[$k] -match $pattern) {
+                $out.Add('@@ ' + ($lines[$k..([Math]::Min($k+$after,$lines.Count-1))] -join ' ').Trim() -replace '\s+',' ')
+                if ($out.Count -ge $max) { break }
+              }
+            }
+            return ($out -join "`n")
+          }
+          Emit "intf" (Ctx "$inc\dot11wificxintf.h" 'OID_WDI_(TASK_SCAN|SET_ADAPTER_CONFIGURATION|TASK_SET_RADIO_STATE|GET_BSS_ENTRY_LIST)\b' 4 8)
+          Emit "tlvfn" (Ctx "$inc\wlan\2.0\TlvGenerated_.hpp" '\b(Parse|Generate)(SetAdapterConfigurationToIhv|SetAdapterConfigurationFromIhv|TaskSetRadioStateToIhv|TaskSetRadioStateFromIhv|TaskScanToIhv|TaskScanFromIhv|IndicationScanCompleteFromIhv|IndicationBssEntryListFromIhv)\s*\(' 7 16)

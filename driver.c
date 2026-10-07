@@ -8,6 +8,9 @@
  *   3. power-on sequence
  *   4. firmware download (rtl8188eufw.bin rev 28.0) + wait for WINTINI_RDY
  *   5. MAC/BB/AGC/RF register tables replayed from the capture (507 writes) + read-back check
+ *   6. RF init / calibration / RX config replayed from the capture (636 writes + delays)
+ *   7. passive scan: hop channels 1..13, read bulk-IN, parse beacons/probe responses,
+ *      publish SSID list to the registry (proves RF + RX path)
  *
  * Progress/results are written to the device registry key so they can be read
  * without a debugger:
@@ -27,6 +30,7 @@
 
 #include "fwdata.h"
 #include "inittab.h"
+#include "inittab2.h"
 
 #define TAG "rtl8188eu: "
 #define LOG(fmt, ...) \
@@ -60,6 +64,10 @@
 #define EFUSE_MAC_ADDR_88EU 0xD7
 
 #define MAX_BULK_OUT        3
+#define RTL_MAX_BSS         24
+#define RX_BUF_SIZE         16384
+#define RX_DESC_LEN         24
+#define SCAN_DWELL_100NS    3000000LL   /* 300 ms per channel */
 
 typedef struct _DEVICE_CONTEXT {
     WDFUSBDEVICE    UsbDevice;
@@ -68,6 +76,17 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      BulkOut[MAX_BULK_OUT];
     ULONG           BulkOutCount;
     UCHAR           EfuseMap[EFUSE_MAP_LEN];
+    ULONG           ScanFrames;
+    ULONG           ScanMgmt;
+    ULONG           ScanBadCrc;
+    ULONG           BssCount;
+    struct {
+        UCHAR  Bssid[6];
+        UCHAR  Ssid[33];
+        UCHAR  Ch;
+        UCHAR  RxCh;
+        ULONG  Hits;
+    } Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
@@ -148,7 +167,19 @@ static VOID RegLog(WDFDEVICE dev, PCWSTR name, ULONG value)
     WdfRegistryClose(key);
 }
 
-/* ---- EFUSE ------------------------------------------------------------- */
+static VOID RegLogStr(WDFDEVICE dev, PCWSTR name, PCWSTR value)
+{
+    WDFKEY key;
+    UNICODE_STRING nm, val;
+    if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(dev, PLUGPLAY_REGKEY_DEVICE, KEY_WRITE,
+                                             WDF_NO_OBJECT_ATTRIBUTES, &key))) return;
+    RtlInitUnicodeString(&nm, name);
+    RtlInitUnicodeString(&val, value);
+    (VOID)WdfRegistryAssignUnicodeString(key, &nm, &val);
+    WdfRegistryClose(key);
+}
+
+/* ---- EFUSE -------------------------------------------------------------- */
 
 static NTSTATUS EfuseRead8(PDEVICE_CONTEXT c, USHORT addr, UCHAR *out)
 {
@@ -348,20 +379,163 @@ static NTSTATUS Rtl_ReplayInit(PDEVICE_CONTEXT c, ULONG *done)
 
 /* Read back every 32-bit baseband register that the table wrote exactly once
  * and compare.  Informational: some bits may legitimately differ. */
-static NTSTATUS Rtl_VerifyInit(PDEVICE_CONTEXT c, ULONG *mismatch, ULONG *firstReg, ULONG *firstGot)
+static NTSTATUS Rtl_VerifyInit(PDEVICE_CONTEXT c, WDFDEVICE dev, ULONG *mismatch, ULONG *firstReg, ULONG *firstGot)
 {
     ULONG i, v;
     NTSTATUS st;
+    WCHAR nm[32];
 
     *mismatch = 0; *firstReg = 0; *firstGot = 0;
     for (i = 0; i < RTL_VERIFY_COUNT; i++) {
         CHK(Rtl_Read32(c, g_VerifyTab[i].Reg, &v));
         if (v != g_VerifyTab[i].Val) {
             if (*mismatch == 0) { *firstReg = g_VerifyTab[i].Reg; *firstGot = v; }
+            if (*mismatch < 8) {   /* Log_Mis<n>_Reg / _Got / _Want */
+                if (NT_SUCCESS(RtlStringCchPrintfW(nm, 32, L"Log_Mis%u_Reg", *mismatch))) RegLog(dev, nm, g_VerifyTab[i].Reg);
+                if (NT_SUCCESS(RtlStringCchPrintfW(nm, 32, L"Log_Mis%u_Got", *mismatch))) RegLog(dev, nm, v);
+                if (NT_SUCCESS(RtlStringCchPrintfW(nm, 32, L"Log_Mis%u_Want", *mismatch))) RegLog(dev, nm, g_VerifyTab[i].Val);
+            }
             (*mismatch)++;
         }
     }
     return STATUS_SUCCESS;
+}
+
+/* ---- phase 3d: RF init / calibration / RX config (capture replay with delays) ---- */
+
+static VOID SleepMs(LONG ms)
+{
+    LARGE_INTEGER d;
+    d.QuadPart = -(LONGLONG)ms * 10000;
+    KeDelayExecutionThread(KernelMode, FALSE, &d);
+}
+
+static NTSTATUS Rtl_ReplayInit2(PDEVICE_CONTEXT c, ULONG *done)
+{
+    ULONG i;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    for (i = 0; i < RTL_INIT2_COUNT; i++) {
+        const RTL_INIT_OP *op = &g_Init2Tab[i];
+        switch (op->Len) {
+        case 0:  SleepMs((LONG)op->Val); st = STATUS_SUCCESS; break;
+        case 1:  st = Rtl_Write8 (c, op->Reg, (UCHAR)op->Val);  break;
+        case 2:  st = Rtl_Write16(c, op->Reg, (USHORT)op->Val); break;
+        default: st = Rtl_Write32(c, op->Reg, op->Val);         break;
+        }
+        if (!NT_SUCCESS(st)) { *done = i; return st; }
+    }
+    *done = i;
+    return STATUS_SUCCESS;
+}
+
+/* RF register 0x18 (channel/bandwidth), path A, via the LSSI write port 0x840:
+ * word = (rf_reg << 20) | data.  Capture: ch1 -> 0x01807c01, ch2 -> 0x01807c02 ... */
+static NTSTATUS Rtl_SetChannel(PDEVICE_CONTEXT c, UCHAR ch)
+{
+    return Rtl_Write32(c, 0x0840, 0x01807C00u | ch);
+}
+
+/* ---- phase 4a: passive scan over bulk-IN ---------------------------------- */
+
+static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh)
+{
+    ULONG i;
+    for (i = 0; i < c->BssCount; i++) {
+        if (RtlCompareMemory(c->Bss[i].Bssid, bssid, 6) == 6) { c->Bss[i].Hits++; return; }
+    }
+    if (c->BssCount >= RTL_MAX_BSS) return;
+    RtlCopyMemory(c->Bss[i].Bssid, bssid, 6);
+    if (ssidLen > 32) ssidLen = 32;
+    RtlCopyMemory(c->Bss[i].Ssid, ssid, ssidLen);
+    c->Bss[i].Ssid[ssidLen] = 0;
+    c->Bss[i].Ch = bssCh;
+    c->Bss[i].RxCh = rxCh;
+    c->Bss[i].Hits = 1;
+    c->BssCount++;
+}
+
+static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHAR rxCh)
+{
+    UCHAR type, subtype, ch = 0, ssidLen = 0;
+    const UCHAR *ssid = (const UCHAR *)"";
+    const UCHAR *p, *end;
+
+    c->ScanFrames++;
+    if (len < 36) return;
+    type = (UCHAR)((f[0] >> 2) & 3);
+    subtype = (UCHAR)((f[0] >> 4) & 0xF);
+    if (type != 0) return;
+    c->ScanMgmt++;
+    if (subtype != 8 && subtype != 5) return;          /* beacon / probe response */
+
+    p = f + 36;                                        /* 24 hdr + 12 fixed fields */
+    end = f + len;
+    while (p + 2 <= end) {
+        UCHAR id = p[0], l = p[1];
+        if (p + 2 + l > end) break;
+        if (id == 0) { ssid = p + 2; ssidLen = l; }
+        else if (id == 3 && l >= 1) ch = p[2];
+        p += 2 + l;
+    }
+    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh);
+}
+
+static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCHAR rxCh)
+{
+    ULONG off = 0;
+    while (off + RX_DESC_LEN <= len) {
+        ULONG v0 = *(const ULONG *)(buf + off);
+        ULONG pktLen = v0 & 0x3FFF;
+        ULONG drvInfo = ((v0 >> 16) & 0xF) * 8;
+        ULONG shift = (v0 >> 24) & 3;
+        ULONG hdr = RX_DESC_LEN + drvInfo + shift;
+        ULONG adv;
+        if (pktLen == 0 || off + hdr + pktLen > len) break;
+        if (v0 & 0xC000) c->ScanBadCrc++;             /* CRC32 / ICV error */
+        else Scan_ProcessFrame(c, buf + off + hdr, pktLen, rxCh);
+        adv = (hdr + pktLen + 127) & ~127u;            /* entries are 128-byte aligned */
+        off += adv;
+    }
+}
+
+static NTSTATUS Rtl_Scan(PDEVICE_CONTEXT c, ULONG *readsOk, ULONG *readsTimeout)
+{
+    PUCHAR buf;
+    UCHAR ch;
+    NTSTATUS st = STATUS_SUCCESS;
+    WDF_MEMORY_DESCRIPTOR md;
+    WDF_REQUEST_SEND_OPTIONS opts;
+
+    if (!c->BulkIn) return STATUS_DEVICE_NOT_READY;
+    buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, RX_BUF_SIZE, 'ur8R');
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+
+    WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(60));
+
+    c->ScanFrames = c->ScanMgmt = c->ScanBadCrc = c->BssCount = 0;
+    RtlZeroMemory(c->Bss, sizeof(c->Bss));
+    *readsOk = *readsTimeout = 0;
+
+    CHK(Rtl_Write32(c, 0x0608, 0x7000600E));           /* RCR: accept all mgmt/beacons (scan mode) */
+
+    for (ch = 1; ch <= 13; ch++) {
+        ULONGLONG until;
+        st = Rtl_SetChannel(c, ch);
+        if (!NT_SUCCESS(st)) break;
+        until = KeQueryInterruptTime() + SCAN_DWELL_100NS;
+        while (KeQueryInterruptTime() < until) {
+            ULONG_PTR got = 0;
+            NTSTATUS rs;
+            WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, buf, RX_BUF_SIZE);
+            rs = WdfUsbTargetPipeReadSynchronously(c->BulkIn, WDF_NO_HANDLE, &opts, &md, (PULONG)&got);
+            if (NT_SUCCESS(rs) && got > 0) { (*readsOk)++; Scan_ParseBuffer(c, buf, (ULONG)got, ch); }
+            else (*readsTimeout)++;
+        }
+    }
+    ExFreePoolWithTag(buf, 'ur8R');
+    return st;
 }
 
 /* ---- driver ------------------------------------------------------------ */
@@ -397,6 +571,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     UCHAR i, npipes;
     ULONG sysCfg = 0, rawLen = 0, reg80 = 0, polls = 0;
     ULONG initDone = 0, vMismatch = 0, vFirstReg = 0, vFirstGot = 0;
+    ULONG init2Done = 0, rdOk = 0, rdTo = 0, bi;
     USHORT r9346 = 0;
     WCHAR nm[32];
 
@@ -493,7 +668,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         LOG("init replay st=0x%08x done=%lu/%u", st, initDone, (unsigned)RTL_INIT_COUNT);
         if (NT_SUCCESS(st)) {
             RegLog(dev, L"Log_Stage", 9);   /* tables written */
-            st = Rtl_VerifyInit(ctx, &vMismatch, &vFirstReg, &vFirstGot);
+            st = Rtl_VerifyInit(ctx, dev, &vMismatch, &vFirstReg, &vFirstGot);
             RegLog(dev, L"Log_Verify_Status", (ULONG)st);
             RegLog(dev, L"Log_Verify_Count", RTL_VERIFY_COUNT);
             RegLog(dev, L"Log_Verify_Mismatch", vMismatch);
@@ -501,6 +676,44 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
             RegLog(dev, L"Log_Verify_FirstGot", vFirstGot);
             if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 10);   /* verify finished */
         }
+    }
+
+    /* ---- Phase 3d: RF init + calibration + RX config (replay with delays) */
+    if (NT_SUCCESS(st)) {
+        st = Rtl_ReplayInit2(ctx, &init2Done);
+        RegLog(dev, L"Log_Init2_Status", (ULONG)st);
+        RegLog(dev, L"Log_Init2_Done", init2Done);
+        LOG("init2 replay st=0x%08x done=%lu/%u", st, init2Done, (unsigned)RTL_INIT2_COUNT);
+        if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 11);   /* RF/cal replayed */
+    }
+
+    /* ---- Phase 4a: passive scan, 13 channels x 300 ms (~4 s) */
+    if (NT_SUCCESS(st)) {
+        st = Rtl_Scan(ctx, &rdOk, &rdTo);
+        RegLog(dev, L"Log_Scan_Status", (ULONG)st);
+        RegLog(dev, L"Log_Scan_ReadsOk", rdOk);
+        RegLog(dev, L"Log_Scan_ReadsTimeout", rdTo);
+        RegLog(dev, L"Log_Scan_Frames", ctx->ScanFrames);
+        RegLog(dev, L"Log_Scan_Mgmt", ctx->ScanMgmt);
+        RegLog(dev, L"Log_Scan_BadCrc", ctx->ScanBadCrc);
+        RegLog(dev, L"Log_Scan_BssCount", ctx->BssCount);
+        for (bi = 0; bi < ctx->BssCount; bi++) {
+            WCHAR name[24], val[96], ssw[34];
+            ULONG k;
+            for (k = 0; ctx->Bss[bi].Ssid[k] && k < 32; k++)
+                ssw[k] = (ctx->Bss[bi].Ssid[k] >= 0x20 && ctx->Bss[bi].Ssid[k] < 0x7F) ? (WCHAR)ctx->Bss[bi].Ssid[k] : L'?';
+            ssw[k] = 0;
+            if (NT_SUCCESS(RtlStringCchPrintfW(name, 24, L"Scan_Bss%02u", bi)) &&
+                NT_SUCCESS(RtlStringCchPrintfW(val, 96, L"%ws | %02x:%02x:%02x:%02x:%02x:%02x | ch%u (heard on %u) | hits %lu",
+                    ssw[0] ? ssw : L"<hidden>",
+                    ctx->Bss[bi].Bssid[0], ctx->Bss[bi].Bssid[1], ctx->Bss[bi].Bssid[2],
+                    ctx->Bss[bi].Bssid[3], ctx->Bss[bi].Bssid[4], ctx->Bss[bi].Bssid[5],
+                    (ULONG)ctx->Bss[bi].Ch, (ULONG)ctx->Bss[bi].RxCh, ctx->Bss[bi].Hits)))
+                RegLogStr(dev, name, val);
+        }
+        LOG("scan st=0x%08x reads ok=%lu timeout=%lu frames=%lu mgmt=%lu bss=%lu",
+            st, rdOk, rdTo, ctx->ScanFrames, ctx->ScanMgmt, ctx->BssCount);
+        if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 12);   /* scan finished */
     }
 
     return STATUS_SUCCESS;   /* load anyway so we can inspect logs */

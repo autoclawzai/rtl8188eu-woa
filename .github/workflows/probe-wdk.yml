@@ -31,6 +31,6 @@ jobs:
               }
               return ($parts -join "`n")
             }
-            Emit "intf" (Ctx "$inc\dot11wificxintf.h" 'OID_WDI_(TASK_SCAN|SET_ADAPTER_CONFIGURATION|TASK_SET_RADIO_STATE|GET_BSS_ENTRY_LIST)\b' 4 8)
-            Emit "tlvfn" (Ctx "$inc\wlan\2.0\TlvGenerated_.hpp" '\b(Parse|Generate)(SetAdapterConfigurationToIhv|SetAdapterConfigurationFromIhv|TaskSetRadioStateToIhv|TaskSetRadioStateFromIhv|TaskScanToIhv|TaskScanFromIhv|IndicationScanCompleteFromIhv|IndicationBssEntryListFromIhv)\s*\(' 7 16)
+
+            Emit "tlvfn" (Ctx "$inc\wlan\2.0\TlvGenerated_.hpp" '\b(Parse|Generate)Wdi(SetAdapterConfigurationToIhv|SetAdapterConfigurationFromIhv|TaskSetRadioStateToIhv|TaskSetRadioStateFromIhv|TaskScanToIhv|TaskScanFromIhv|IndicationScanCompleteFromIhv|IndicationBssEntryListFromIhv)\s*\(' 7 16)
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

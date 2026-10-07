@@ -10,26 +10,27 @@ jobs:
       - name: Signatures
         shell: pwsh
         run: |
-          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-          function Emit($title, $text) {
-            $text = $text -replace '%','%25'
-            $i = 0
-            while ($text.Length -gt 0 -and $i -lt 9) {
-              $n = [Math]::Min(3600, $text.Length)
-              Write-Host "::notice title=$title#$i::$($text.Substring(0,$n).Replace("`n",'%0A'))"
-              $text = $text.Substring($n); $i++
-            }
-          }
-          function Ctx($file, $pattern, $after, $max) {
-            $lines = Get-Content $file
-            $out = New-Object System.Collections.Generic.List[string]
-            for ($k=0; $k -lt $lines.Count; $k++) {
-              if ($lines[$k] -match $pattern) {
-                $out.Add('@@ ' + ($lines[$k..([Math]::Min($k+$after,$lines.Count-1))] -join ' ').Trim() -replace '\s+',' ')
-                if ($out.Count -ge $max) { break }
+          try {
+            $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+            $nl = [Environment]::NewLine
+            function Emit([string]$title, [string]$text) {
+              $text = $text.Replace('%','%25').Replace("`r",'').Replace("`n",'%0A')
+              $i = 0
+              while ($text.Length -gt 0 -and $i -lt 9) {
+                $n = [Math]::Min(3600, $text.Length)
+                Write-Host ("::notice title=" + $title + "#" + $i + "::" + $text.Substring(0,$n))
+                $text = $text.Substring($n); $i++
               }
             }
-            return ($out -join "`n")
-          }
-          Emit "intf" (Ctx "$inc\dot11wificxintf.h" 'OID_WDI_(TASK_SCAN|SET_ADAPTER_CONFIGURATION|TASK_SET_RADIO_STATE|GET_BSS_ENTRY_LIST)\b' 4 8)
-          Emit "tlvfn" (Ctx "$inc\wlan\2.0\TlvGenerated_.hpp" '\b(Parse|Generate)(SetAdapterConfigurationToIhv|SetAdapterConfigurationFromIhv|TaskSetRadioStateToIhv|TaskSetRadioStateFromIhv|TaskScanToIhv|TaskScanFromIhv|IndicationScanCompleteFromIhv|IndicationBssEntryListFromIhv)\s*\(' 7 16)
+            function Ctx([string]$file, [string]$pattern, [int]$after, [int]$max) {
+              $sel = Select-String -Path $file -Pattern $pattern -Context 0,$after | Select-Object -First $max
+              $parts = @()
+              foreach ($s in $sel) {
+                $t = ($s.Line + ' ' + ($s.Context.PostContext -join ' ')) -replace '\s+',' '
+                $parts += ('@@ ' + $t.Trim())
+              }
+              return ($parts -join "`n")
+            }
+            Emit "intf" (Ctx "$inc\dot11wificxintf.h" 'OID_WDI_(TASK_SCAN|SET_ADAPTER_CONFIGURATION|TASK_SET_RADIO_STATE|GET_BSS_ENTRY_LIST)\b' 4 8)
+            Emit "tlvfn" (Ctx "$inc\wlan\2.0\TlvGenerated_.hpp" '\b(Parse|Generate)(SetAdapterConfigurationToIhv|SetAdapterConfigurationFromIhv|TaskSetRadioStateToIhv|TaskSetRadioStateFromIhv|TaskScanToIhv|TaskScanFromIhv|IndicationScanCompleteFromIhv|IndicationBssEntryListFromIhv)\s*\(' 7 16)
+          } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

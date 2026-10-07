@@ -1,4 +1,3 @@
-# One-off probe: which WiFiCx / NetAdapterCx headers and libs does the runner's WDK ship?
 name: probe-wdk
 on:
   push:
@@ -8,41 +7,16 @@ jobs:
   probe:
     runs-on: windows-2022
     steps:
-      - name: List WiFiCx / NetAdapterCx files
-        shell: pwsh
-        run: |
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          function N($t,$m){ Write-Host "::notice title=$t::$m" }
-          $vers = (Get-ChildItem "$kits\Include" -Directory | Where-Object { $_.Name -like '10.*' }).Name -join ', '
-          N "Include versions" $vers
-          $h = Get-ChildItem "$kits\Include" -Recurse -Include "wificx*.h","dot11wificx*","netadaptercx*","NetAdapter.h","netadapter*.h" -ErrorAction SilentlyContinue |
-               ForEach-Object { $_.FullName.Replace($kits,'') } | Select-Object -First 40
-          N "headers" (($h) -join ' ; ')
-          $l = Get-ChildItem "$kits\Lib" -Recurse -Include "*wificx*","*netadaptercx*","*NetAdapter*" -ErrorAction SilentlyContinue |
-               Where-Object { $_.FullName -match 'arm64' } | ForEach-Object { $_.FullName.Replace($kits,'') } | Select-Object -First 40
-          N "arm64 libs" (($l) -join ' ; ')
-          $w = Get-ChildItem "$kits\Include\wdf" -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name + ':' + ((Get-ChildItem $_.FullName -Directory).Name -join '/') }
-          N "wdf include dirs" ($w -join ' ; ')
-          $p = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Recurse -Filter "WindowsKernelModeDriver10.0" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($p) { $t = Get-ChildItem $p.FullName -Recurse -Include "*NetAdapter*","*WiFiCx*","*wificx*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Select-Object -First 20; N "msbuild props" ($t -join ' ; ') }
-
-      - name: Collect headers
+      - name: List
         shell: pwsh
         run: |
           $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0"
-          New-Item -ItemType Directory -Force hdr | Out-Null
-          $pick = @()
-          $pick += Get-ChildItem "$kits\km" -Recurse -Include "wificx*.h","dot11wificx*","wdi*.h","WificxTLV*" -ErrorAction SilentlyContinue
-          $pick += Get-ChildItem "$kits\km\netcx\kmdf\adapter\2.0" -File -ErrorAction SilentlyContinue
-          $pick += Get-ChildItem "$kits" -Recurse -Include "*wificx*","*TLVGen*","*TlvGen*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
-          $pick | Sort-Object FullName -Unique | ForEach-Object {
-            $rel = $_.FullName.Substring($kits.Length+1)
-            $dst = Join-Path hdr $rel
-            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
-            Copy-Item $_.FullName $dst
+          $all = Get-ChildItem $kits -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan|wdi|dot11' -and $_.Extension -in '.h','.hpp','.hxx' }
+          $rel = $all | ForEach-Object { $_.FullName.Substring($kits.Length+1) + '(' + $_.Length + ')' }
+          $line = ($rel -join ' ; ')
+          $i = 0
+          while ($line.Length -gt 0 -and $i -lt 9) {
+            $n = [Math]::Min(3500, $line.Length)
+            Write-Host "::notice title=files$i::$($line.Substring(0,$n))"
+            $line = $line.Substring($n); $i++
           }
-          Get-ChildItem hdr -Recurse -File | ForEach-Object { Write-Host $_.FullName.Substring((Get-Location).Path.Length) $_.Length }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wdk-headers
-          path: hdr

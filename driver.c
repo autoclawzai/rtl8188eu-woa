@@ -67,7 +67,16 @@
 #define RTL_MAX_BSS         24
 #define RX_BUF_SIZE         16384
 #define RX_DESC_LEN         24
-#define SCAN_DWELL_100NS    3000000LL   /* 300 ms per channel */
+#define SCAN_DWELL_100NS    3000000LL   /* 300 ms per channel (passive) */
+#define ACT_DWELL_100NS     1500000LL   /* 150 ms per channel (active)  */
+#define ACT_PROBE2_100NS     700000LL   /* 2nd probe 70 ms into dwell   */
+
+/* Phase 4b: TX. Descriptor is 32 bytes (rtl8xxxu txdesc32 layout, verified on
+ * capture: pkt_size 73 + 32 = 105 bytes on bulk OUT ep 0x02). */
+#define TXDESC_LEN          32
+#define PROBE_LEN           73
+#define TX_ENDPOINT         0x02
+#define TX_MAX_CONSEC_FAIL  3
 
 typedef struct _DEVICE_CONTEXT {
     WDFUSBDEVICE    UsbDevice;
@@ -75,17 +84,26 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      BulkIn;
     WDFUSBPIPE      BulkOut[MAX_BULK_OUT];
     ULONG           BulkOutCount;
+    WDFUSBPIPE      TxPipe;                 /* bulk OUT ep 0x02 (mgmt queue) */
+    UCHAR           Mac[6];
     UCHAR           EfuseMap[EFUSE_MAP_LEN];
     ULONG           ScanFrames;
     ULONG           ScanMgmt;
     ULONG           ScanBadCrc;
+    ULONG           ScanProbeResp;
     ULONG           BssCount;
+    ULONG           TxSeq;
+    ULONG           TxOk;
+    ULONG           TxFail;
+    NTSTATUS        TxFirstErr;
+    UCHAR           TxBuf[TXDESC_LEN + PROBE_LEN + 7];   /* 112, nonpaged context memory */
     struct {
         UCHAR  Bssid[6];
         UCHAR  Ssid[33];
         UCHAR  Ch;
         UCHAR  RxCh;
         ULONG  Hits;
+        ULONG  Resp;                        /* probe responses seen */
     } Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -438,20 +456,30 @@ static NTSTATUS Rtl_SetChannel(PDEVICE_CONTEXT c, UCHAR ch)
 
 /* ---- phase 4a: passive scan over bulk-IN ---------------------------------- */
 
-static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh)
+static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh, BOOLEAN isResp)
 {
     ULONG i;
+    if (ssidLen > 32) ssidLen = 32;
     for (i = 0; i < c->BssCount; i++) {
-        if (RtlCompareMemory(c->Bss[i].Bssid, bssid, 6) == 6) { c->Bss[i].Hits++; return; }
+        if (RtlCompareMemory(c->Bss[i].Bssid, bssid, 6) == 6) {
+            c->Bss[i].Hits++;
+            if (isResp) c->Bss[i].Resp++;
+            /* hidden AP: beacon has empty/zeroed SSID, probe response carries the real one */
+            if (c->Bss[i].Ssid[0] == 0 && ssidLen > 0 && ssid[0] != 0) {
+                RtlCopyMemory(c->Bss[i].Ssid, ssid, ssidLen);
+                c->Bss[i].Ssid[ssidLen] = 0;
+            }
+            return;
+        }
     }
     if (c->BssCount >= RTL_MAX_BSS) return;
     RtlCopyMemory(c->Bss[i].Bssid, bssid, 6);
-    if (ssidLen > 32) ssidLen = 32;
     RtlCopyMemory(c->Bss[i].Ssid, ssid, ssidLen);
     c->Bss[i].Ssid[ssidLen] = 0;
     c->Bss[i].Ch = bssCh;
     c->Bss[i].RxCh = rxCh;
     c->Bss[i].Hits = 1;
+    c->Bss[i].Resp = isResp ? 1 : 0;
     c->BssCount++;
 }
 
@@ -468,6 +496,7 @@ static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHA
     if (type != 0) return;
     c->ScanMgmt++;
     if (subtype != 8 && subtype != 5) return;          /* beacon / probe response */
+    if (subtype == 5) c->ScanProbeResp++;
 
     p = f + 36;                                        /* 24 hdr + 12 fixed fields */
     end = f + len;
@@ -478,7 +507,7 @@ static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHA
         else if (id == 3 && l >= 1) ch = p[2];
         p += 2 + l;
     }
-    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh);
+    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh, (BOOLEAN)(subtype == 5));
 }
 
 static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCHAR rxCh)
@@ -538,6 +567,158 @@ static NTSTATUS Rtl_Scan(PDEVICE_CONTEXT c, ULONG *readsOk, ULONG *readsTimeout)
     return st;
 }
 
+/* ---- phase 4b: TX (probe request) + active scan ------------------------- */
+
+/* Probe request exactly as rtl8xxxu sent it in the capture (73 bytes):
+ * FC=0x0040, DA=ff*6, SA=our MAC, BSSID=ff*6, SC, SSID(wildcard), rates(1,2,5.5,11,6,9,12,18),
+ * ext rates(24,36,48,54), DS channel, HT capabilities. SA/SC/channel patched per frame. */
+#define PROBE_OFF_SA   10
+#define PROBE_OFF_SC   22
+#define PROBE_OFF_CH   44
+static const UCHAR g_ProbeTmpl[PROBE_LEN] = {
+    0x40, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x10, 0x27, 0xf5, 0x99, 0x50, 0x56,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x04, 0x0b, 0x16,
+    0x0c, 0x12, 0x18, 0x24, 0x32, 0x04, 0x30, 0x48, 0x60, 0x6c, 0x03, 0x01, 0x01, 0x2d, 0x1a, 0x6c,
+    0x00, 0x1f, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+/* Per-channel TX power / band regs, as the capture wrote them on every hop.
+ * Group value g: ch1-2 = 0x2f, ch3-8 = 0x2e, ch9-13 = 0x2d (this adapter's EFUSE;
+ * phase 4c derives these from the EFUSE map instead). */
+static NTSTATUS Rtl_TxChannelSetup(PDEVICE_CONTEXT c, UCHAR ch)
+{
+    NTSTATUS st;
+    ULONG g = (ch <= 2) ? 0x2F : (ch <= 8) ? 0x2E : 0x2D;
+    ULONG p = g + 3;
+    ULONG pp = p | (p << 8) | (p << 16) | (p << 24);
+
+    CHK(Rtl_Write32(c, 0x0E08, 0x03900000u | (g << 8) | 0x2D));
+    CHK(Rtl_Write32(c, 0x086C, (g << 8) | (g << 16) | (g << 24)));
+    CHK(Rtl_Write32(c, 0x0E00, pp));
+    CHK(Rtl_Write32(c, 0x0E04, pp));
+    CHK(Rtl_Write32(c, 0x0E10, pp));
+    CHK(Rtl_Write32(c, 0x0E14, pp));
+    CHK(Rtl_Write32(c, 0x0E18, pp));
+    CHK(Rtl_Write32(c, 0x0E1C, pp));
+    CHK(Rtl_Write8 (c, 0x0603, 0x04));
+    CHK(Rtl_Write32(c, 0x0800, 0x83040000u));    /* 2.4 GHz: CCK + OFDM on */
+    CHK(Rtl_Write32(c, 0x0900, 0x00000000u));
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS Rtl_SendProbe(PDEVICE_CONTEXT c, UCHAR ch)
+{
+    ULONG w[8];
+    USHORT ck = 0, sc;
+    ULONG seq = c->TxSeq++ & 0xFFF;
+    PUCHAR b = c->TxBuf;
+    UCHAR i;
+    WDF_MEMORY_DESCRIPTOR md;
+    WDF_REQUEST_SEND_OPTIONS opts;
+    ULONG_PTR written = 0;
+    NTSTATUS st;
+
+    if (!c->TxPipe) return STATUS_DEVICE_NOT_READY;
+
+    /* frame body */
+    RtlCopyMemory(b + TXDESC_LEN, g_ProbeTmpl, PROBE_LEN);
+    if ((c->Mac[0] | c->Mac[1] | c->Mac[2] | c->Mac[3] | c->Mac[4] | c->Mac[5]) != 0)
+        RtlCopyMemory(b + TXDESC_LEN + PROBE_OFF_SA, c->Mac, 6);
+    sc = (USHORT)(seq << 4);
+    b[TXDESC_LEN + PROBE_OFF_SC]     = (UCHAR)(sc & 0xFF);
+    b[TXDESC_LEN + PROBE_OFF_SC + 1] = (UCHAR)(sc >> 8);
+    b[TXDESC_LEN + PROBE_OFF_CH]     = ch;
+
+    /* descriptor: values taken 1:1 from the 104 captured probe requests */
+    w[0] = 0x8D200000u | PROBE_LEN;   /* OWN|FSG|LSG|BMC, pkt_offset=32, pkt_size=73 */
+    w[1] = 0x00001200u;               /* queue select = MGNT (0x12) */
+    w[2] = 0x03010000u;
+    w[3] = seq << 16;                 /* sequence number */
+    w[4] = 0x00000100u;
+    w[5] = 0x001A0000u;
+    w[6] = 0;
+    w[7] = 0x20000000u;               /* checksum goes in the low 16 bits */
+    for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
+    w[7] |= ck;
+    RtlCopyMemory(b, w, TXDESC_LEN);
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, TXDESC_LEN + PROBE_LEN);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
+    st = WdfUsbTargetPipeWriteSynchronously(c->TxPipe, WDF_NO_HANDLE, &opts, &md, (PULONG)&written);
+    if (NT_SUCCESS(st) && written != TXDESC_LEN + PROBE_LEN) st = STATUS_IO_DEVICE_ERROR;
+    if (NT_SUCCESS(st)) c->TxOk++;
+    else { if (c->TxFail == 0) c->TxFirstErr = st; c->TxFail++; }
+    return st;
+}
+
+static NTSTATUS Rtl_ActiveScan(PDEVICE_CONTEXT c, ULONG *readsOk, ULONG *readsTimeout)
+{
+    PUCHAR buf;
+    UCHAR ch;
+    ULONG consecFail = 0;
+    NTSTATUS st = STATUS_SUCCESS;
+    WDF_MEMORY_DESCRIPTOR md;
+    WDF_REQUEST_SEND_OPTIONS opts;
+
+    if (!c->BulkIn || !c->TxPipe) return STATUS_DEVICE_NOT_READY;
+    buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, RX_BUF_SIZE, 'ur8R');
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+
+    WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(40));
+    *readsOk = *readsTimeout = 0;
+
+    for (ch = 1; ch <= 13; ch++) {
+        ULONGLONG start, until;
+        BOOLEAN second = FALSE;
+
+        st = Rtl_TxChannelSetup(c, ch);
+        if (NT_SUCCESS(st)) st = Rtl_SetChannel(c, ch);
+        if (!NT_SUCCESS(st)) break;
+
+        start = KeQueryInterruptTime();
+        until = start + ACT_DWELL_100NS;
+        if (NT_SUCCESS(Rtl_SendProbe(c, ch))) consecFail = 0; else consecFail++;
+
+        while (KeQueryInterruptTime() < until && consecFail < TX_MAX_CONSEC_FAIL) {
+            ULONG_PTR got = 0;
+            NTSTATUS rs;
+            if (!second && KeQueryInterruptTime() >= start + ACT_PROBE2_100NS) {
+                second = TRUE;
+                if (NT_SUCCESS(Rtl_SendProbe(c, ch))) consecFail = 0; else consecFail++;
+            }
+            WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, buf, RX_BUF_SIZE);
+            rs = WdfUsbTargetPipeReadSynchronously(c->BulkIn, WDF_NO_HANDLE, &opts, &md, (PULONG)&got);
+            if (NT_SUCCESS(rs) && got > 0) { (*readsOk)++; Scan_ParseBuffer(c, buf, (ULONG)got, ch); }
+            else (*readsTimeout)++;
+        }
+        if (consecFail >= TX_MAX_CONSEC_FAIL) { st = c->TxFirstErr; break; }   /* TX path dead, stop early */
+    }
+    ExFreePoolWithTag(buf, 'ur8R');
+    return st;
+}
+
+static VOID LogBssList(WDFDEVICE dev, PDEVICE_CONTEXT c)
+{
+    ULONG bi;
+    for (bi = 0; bi < c->BssCount; bi++) {
+        WCHAR name[24], val[112], ssw[34];
+        ULONG k;
+        for (k = 0; c->Bss[bi].Ssid[k] && k < 32; k++)
+            ssw[k] = (c->Bss[bi].Ssid[k] >= 0x20 && c->Bss[bi].Ssid[k] < 0x7F) ? (WCHAR)c->Bss[bi].Ssid[k] : L'?';
+        ssw[k] = 0;
+        if (NT_SUCCESS(RtlStringCchPrintfW(name, 24, L"Scan_Bss%02u", bi)) &&
+            NT_SUCCESS(RtlStringCchPrintfW(val, 112, L"%ws | %02x:%02x:%02x:%02x:%02x:%02x | ch%u (heard on %u) | hits %lu | resp %lu",
+                ssw[0] ? ssw : L"<hidden>",
+                c->Bss[bi].Bssid[0], c->Bss[bi].Bssid[1], c->Bss[bi].Bssid[2],
+                c->Bss[bi].Bssid[3], c->Bss[bi].Bssid[4], c->Bss[bi].Bssid[5],
+                (ULONG)c->Bss[bi].Ch, (ULONG)c->Bss[bi].RxCh, c->Bss[bi].Hits, c->Bss[bi].Resp)))
+            RegLogStr(dev, name, val);
+    }
+}
+
 /* ---- driver ------------------------------------------------------------ */
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING reg)
@@ -571,7 +752,8 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     UCHAR i, npipes;
     ULONG sysCfg = 0, rawLen = 0, reg80 = 0, polls = 0;
     ULONG initDone = 0, vMismatch = 0, vFirstReg = 0, vFirstGot = 0;
-    ULONG init2Done = 0, rdOk = 0, rdTo = 0, bi;
+    ULONG init2Done = 0, rdOk = 0, rdTo = 0;
+    ULONG actOk = 0, actTo = 0, snapFrames, snapMgmt, snapBad, snapBss;
     USHORT r9346 = 0;
     WCHAR nm[32];
 
@@ -614,10 +796,12 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
             ctx->BulkIn = pipe;
         } else if (WdfUsbTargetPipeIsOutEndpoint(pipe) && ctx->BulkOutCount < MAX_BULK_OUT) {
             ctx->BulkOut[ctx->BulkOutCount++] = pipe;
+            if (pi.EndpointAddress == TX_ENDPOINT) ctx->TxPipe = pipe;
         }
     }
     RegLog(dev, L"Log_BulkIn", ctx->BulkIn ? 1 : 0);
     RegLog(dev, L"Log_BulkOutCount", ctx->BulkOutCount);
+    RegLog(dev, L"Log_TxPipe", ctx->TxPipe ? 1 : 0);
     LOG("bulk in=%p, bulk out count=%lu (expect 1 in, 2 out)", ctx->BulkIn, ctx->BulkOutCount);
     RegLog(dev, L"Log_Stage", 4);   /* pipes enumerated */
 
@@ -639,6 +823,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     RegLog(dev, L"Log_Efuse_RawLen", rawLen);
     if (NT_SUCCESS(st)) {
         const UCHAR *m = ctx->EfuseMap + EFUSE_MAC_ADDR_88EU;
+        RtlCopyMemory(ctx->Mac, m, 6);
         RegLog(dev, L"Log_MacA", (ULONG)m[0] | ((ULONG)m[1] << 8) | ((ULONG)m[2] << 16) | ((ULONG)m[3] << 24));
         RegLog(dev, L"Log_MacB", (ULONG)m[4] | ((ULONG)m[5] << 8));
         LOG("EFUSE ok, raw=%lu MAC=%02x:%02x:%02x:%02x:%02x:%02x", rawLen, m[0], m[1], m[2], m[3], m[4], m[5]);
@@ -697,23 +882,32 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         RegLog(dev, L"Log_Scan_Mgmt", ctx->ScanMgmt);
         RegLog(dev, L"Log_Scan_BadCrc", ctx->ScanBadCrc);
         RegLog(dev, L"Log_Scan_BssCount", ctx->BssCount);
-        for (bi = 0; bi < ctx->BssCount; bi++) {
-            WCHAR name[24], val[96], ssw[34];
-            ULONG k;
-            for (k = 0; ctx->Bss[bi].Ssid[k] && k < 32; k++)
-                ssw[k] = (ctx->Bss[bi].Ssid[k] >= 0x20 && ctx->Bss[bi].Ssid[k] < 0x7F) ? (WCHAR)ctx->Bss[bi].Ssid[k] : L'?';
-            ssw[k] = 0;
-            if (NT_SUCCESS(RtlStringCchPrintfW(name, 24, L"Scan_Bss%02u", bi)) &&
-                NT_SUCCESS(RtlStringCchPrintfW(val, 96, L"%ws | %02x:%02x:%02x:%02x:%02x:%02x | ch%u (heard on %u) | hits %lu",
-                    ssw[0] ? ssw : L"<hidden>",
-                    ctx->Bss[bi].Bssid[0], ctx->Bss[bi].Bssid[1], ctx->Bss[bi].Bssid[2],
-                    ctx->Bss[bi].Bssid[3], ctx->Bss[bi].Bssid[4], ctx->Bss[bi].Bssid[5],
-                    (ULONG)ctx->Bss[bi].Ch, (ULONG)ctx->Bss[bi].RxCh, ctx->Bss[bi].Hits)))
-                RegLogStr(dev, name, val);
-        }
         LOG("scan st=0x%08x reads ok=%lu timeout=%lu frames=%lu mgmt=%lu bss=%lu",
             st, rdOk, rdTo, ctx->ScanFrames, ctx->ScanMgmt, ctx->BssCount);
         if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 12);   /* scan finished */
+    }
+
+    /* ---- Phase 4b: active scan (probe requests on bulk OUT ep 0x02), 13 ch x 150 ms */
+    if (NT_SUCCESS(st)) {
+        snapFrames = ctx->ScanFrames; snapMgmt = ctx->ScanMgmt; snapBad = ctx->ScanBadCrc; snapBss = ctx->BssCount;
+        LogBssList(dev, ctx);   /* passive result stays visible even if active pass dies */
+        st = Rtl_ActiveScan(ctx, &actOk, &actTo);
+        RegLog(dev, L"Log_Act_Status", (ULONG)st);
+        RegLog(dev, L"Log_Tx_Ok", ctx->TxOk);
+        RegLog(dev, L"Log_Tx_Fail", ctx->TxFail);
+        RegLog(dev, L"Log_Tx_FirstErr", (ULONG)ctx->TxFirstErr);
+        RegLog(dev, L"Log_Act_ReadsOk", actOk);
+        RegLog(dev, L"Log_Act_ReadsTimeout", actTo);
+        RegLog(dev, L"Log_Act_Frames", ctx->ScanFrames - snapFrames);
+        RegLog(dev, L"Log_Act_Mgmt", ctx->ScanMgmt - snapMgmt);
+        RegLog(dev, L"Log_Act_BadCrc", ctx->ScanBadCrc - snapBad);
+        RegLog(dev, L"Log_Act_ProbeResp", ctx->ScanProbeResp);
+        RegLog(dev, L"Log_Act_NewBss", ctx->BssCount - snapBss);
+        RegLog(dev, L"Log_Act_BssCount", ctx->BssCount);
+        LogBssList(dev, ctx);
+        LOG("active scan st=0x%08x tx ok=%lu fail=%lu probe_resp=%lu bss=%lu",
+            st, ctx->TxOk, ctx->TxFail, ctx->ScanProbeResp, ctx->BssCount);
+        if (NT_SUCCESS(st)) RegLog(dev, L"Log_Stage", 13);   /* active scan finished */
     }
 
     return STATUS_SUCCESS;   /* load anyway so we can inspect logs */

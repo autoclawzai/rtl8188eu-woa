@@ -25,3 +25,24 @@ jobs:
           N "wdf include dirs" ($w -join ' ; ')
           $p = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Recurse -Filter "WindowsKernelModeDriver10.0" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($p) { $t = Get-ChildItem $p.FullName -Recurse -Include "*NetAdapter*","*WiFiCx*","*wificx*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Select-Object -First 20; N "msbuild props" ($t -join ' ; ') }
+
+      - name: Collect headers
+        shell: pwsh
+        run: |
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0"
+          New-Item -ItemType Directory -Force hdr | Out-Null
+          $pick = @()
+          $pick += Get-ChildItem "$kits\km" -Recurse -Include "wificx*.h","dot11wificx*","wdi*.h","WificxTLV*" -ErrorAction SilentlyContinue
+          $pick += Get-ChildItem "$kits\km\netcx\kmdf\adapter\2.0" -File -ErrorAction SilentlyContinue
+          $pick += Get-ChildItem "$kits" -Recurse -Include "*wificx*","*TLVGen*","*TlvGen*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
+          $pick | Sort-Object FullName -Unique | ForEach-Object {
+            $rel = $_.FullName.Substring($kits.Length+1)
+            $dst = Join-Path hdr $rel
+            New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
+            Copy-Item $_.FullName $dst
+          }
+          Get-ChildItem hdr -Recurse -File | ForEach-Object { Write-Host $_.FullName.Substring((Get-Location).Path.Length) $_.Length }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wdk-headers
+          path: hdr

@@ -1,0 +1,27 @@
+# One-off probe: which WiFiCx / NetAdapterCx headers and libs does the runner's WDK ship?
+name: probe-wdk
+on:
+  push:
+    paths: [ '.github/workflows/probe-wdk.yml' ]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: windows-2022
+    steps:
+      - name: List WiFiCx / NetAdapterCx files
+        shell: pwsh
+        run: |
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          function N($t,$m){ Write-Host "::notice title=$t::$m" }
+          $vers = (Get-ChildItem "$kits\Include" -Directory | Where-Object { $_.Name -like '10.*' }).Name -join ', '
+          N "Include versions" $vers
+          $h = Get-ChildItem "$kits\Include" -Recurse -Include "wificx*.h","dot11wificx*","netadaptercx*","NetAdapter.h","netadapter*.h" -ErrorAction SilentlyContinue |
+               ForEach-Object { $_.FullName.Replace($kits,'') } | Select-Object -First 40
+          N "headers" (($h) -join ' ; ')
+          $l = Get-ChildItem "$kits\Lib" -Recurse -Include "*wificx*","*netadaptercx*","*NetAdapter*" -ErrorAction SilentlyContinue |
+               Where-Object { $_.FullName -match 'arm64' } | ForEach-Object { $_.FullName.Replace($kits,'') } | Select-Object -First 40
+          N "arm64 libs" (($l) -join ' ; ')
+          $w = Get-ChildItem "$kits\Include\wdf" -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name + ':' + ((Get-ChildItem $_.FullName -Directory).Name -join '/') }
+          N "wdf include dirs" ($w -join ' ; ')
+          $p = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio" -Recurse -Filter "WindowsKernelModeDriver10.0" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($p) { $t = Get-ChildItem $p.FullName -Recurse -Include "*NetAdapter*","*WiFiCx*","*wificx*" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Select-Object -First 20; N "msbuild props" ($t -join ' ; ') }

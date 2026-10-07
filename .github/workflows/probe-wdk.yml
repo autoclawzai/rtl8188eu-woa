@@ -7,20 +7,23 @@ jobs:
   probe:
     runs-on: windows-2022
     steps:
-      - name: Toolset NetAdapter/WiFi references
+      - name: IDs and generated TLV functions
         shell: pwsh
         run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $dirs = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Directory -Filter "WindowsKernelModeDriver10.0" | Select-Object -First 1
-          $files = Get-ChildItem $dirs.Parent.Parent.FullName -Recurse -File -Include *.props,*.targets,*.xml -ErrorAction SilentlyContinue
-          $hits = $files | Select-String -Pattern 'NetAdapter|WiFiCx|Wificx|NETADAPTER' -List | ForEach-Object { $_.Path.Substring($vs.Length) + ':' + $_.LineNumber + ' ' + $_.Line.Trim() }
-          $line = ($hits | Select-Object -First 60) -join ' ;; '
-          $i = 0
-          while ($line.Length -gt 0 -and $i -lt 8) {
-            $n = [Math]::Min(3500, $line.Length)
-            Write-Host "::notice title=hits$i::$($line.Substring(0,$n))"
-            $line = $line.Substring($n); $i++
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+          function Emit($title, $text) {
+            $text = $text -replace '%','%25'
+            $i = 0
+            while ($text.Length -gt 0 -and $i -lt 9) {
+              $n = [Math]::Min(3600, $text.Length)
+              Write-Host "::notice title=$title#$i::$($text.Substring(0,$n))"
+              $text = $text.Substring($n); $i++
+            }
           }
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $ext = Get-ChildItem "$kits\build" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NetAdapter|WiFi|wificx' } | ForEach-Object { $_.FullName.Substring($kits.Length) }
-          Write-Host "::notice title=kitsbuild::$($ext -join ' ; ')"
+          # message ids: lines with #define ... OID_WDI / WDI_ message id style
+          $intf = Get-Content "$inc\dot11wificxintf.h" -Raw
+          $m = [regex]::Matches($intf, '#define\s+(OID_WDI_[A-Z0-9_]+)\s+(\S+)') | ForEach-Object { $_.Groups[1].Value.Replace('OID_WDI_','') + '=' + $_.Groups[2].Value }
+          Emit "ids" (($m | Select-Object -Unique) -join ',')
+          $gen = Get-Content "$inc\wlan\2.0\TlvGenerated_.hpp" -Raw
+          $g = [regex]::Matches($gen, '\b(Parse|Generate)(Wdi[A-Za-z0-9_]+)\s*\(') | ForEach-Object { $_.Groups[1].Value.Substring(0,1) + $_.Groups[2].Value.Replace('Wdi','') } | Select-Object -Unique
+          Emit "gen" ($g -join ',')

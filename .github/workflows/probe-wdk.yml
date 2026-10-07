@@ -6,17 +6,27 @@ on:
 jobs:
   probe:
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        file: [ 'wificx\1.0\wificx.h', 'wificx\1.0\wificxtypes.h', 'wlan\1.0\TlvGeneratorParser.hpp', 'wlan\1.0\arrayofelements.hpp' ]
     steps:
-      - name: List
+      - name: Dump compacted header
         shell: pwsh
         run: |
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0"
-          $all = Get-ChildItem $kits -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan|wdi|dot11' -and $_.Extension -in '.h','.hpp','.hxx' }
-          $rel = $all | ForEach-Object { $_.FullName.Substring($kits.Length+1) + '(' + $_.Length + ')' }
-          $line = ($rel -join ' ; ')
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+          $t = Get-Content (Join-Path $kits '${{ matrix.file }}') -Raw
+          $t = [regex]::Replace($t, '/\*.*?\*/', '', 'Singleline')
+          $t = [regex]::Replace($t, '//[^\r\n]*', '')
+          $t = [regex]::Replace($t, '[ \t]+', ' ')
+          $t = [regex]::Replace($t, '(\r?\n\s*)+', "`n")
+          $t = $t -replace '`','' -replace '%','%25' -replace "`r",'' 
+          $name = '${{ matrix.file }}'.Replace('\','_')
           $i = 0
-          while ($line.Length -gt 0 -and $i -lt 9) {
-            $n = [Math]::Min(3500, $line.Length)
-            Write-Host "::notice title=files$i::$($line.Substring(0,$n))"
-            $line = $line.Substring($n); $i++
+          while ($t.Length -gt 0 -and $i -lt 9) {
+            $n = [Math]::Min(3600, $t.Length)
+            $chunk = $t.Substring(0,$n).Replace("`n",'%0A')
+            Write-Host "::notice title=$name#$i::$chunk"
+            $t = $t.Substring($n); $i++
           }
+          if ($t.Length -gt 0) { Write-Host "::warning title=$name::truncated, $($t.Length) chars left" }

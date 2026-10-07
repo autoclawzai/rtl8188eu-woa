@@ -131,6 +131,7 @@ typedef struct _DEVICE_CONTEXT {
     ULONG           TxConsecFail;
     ULONG           Snap[3][5];             /* frames, mgmt, badcrc, proberesp, bss after passive/active/directed */
     ULONG           RxCallbacks;
+    ULONG           RxZeroLen;
     ULONG64         RxBytes;
     ULONG           ReaderFails;
     ULONG           D0Count, ScanRuns;
@@ -752,7 +753,7 @@ VOID EvtUsbRxComplete(WDFUSBPIPE pipe, WDFMEMORY mem, size_t n, WDFCONTEXT ctx)
     PUCHAR p;
     UNREFERENCED_PARAMETER(pipe);
 
-    if (n == 0) return;
+    if (n == 0) { c->RxZeroLen++; return; }
     p = (PUCHAR)WdfMemoryGetBuffer(mem, NULL);
     c->RxCallbacks++;
     c->RxBytes += n;
@@ -902,6 +903,8 @@ static VOID ScanFinish(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_Callbacks", c->RxCallbacks);
     RegLog(dev, L"Log_Rx_Bytes", (ULONG)c->RxBytes);
     RegLog(dev, L"Log_Rx_ReaderFails", c->ReaderFails);
+    RegLog(dev, L"Log_Rx_ZeroLen", c->RxZeroLen);
+    RegLog(dev, L"Log_Rx_StateEnd", (ULONG)WdfIoTargetGetState(WdfUsbTargetPipeGetIoTarget(c->BulkIn)));
     RegLog(dev, L"Log_Scan_Runs", c->ScanRuns);
     LogBssList(dev, c);
     LOG("scan done st=0x%08x tx ok=%lu fail=%lu probe_resp=%lu", c->ScanStatus, c->TxOk, c->TxFail, sn[2][3]);
@@ -1144,6 +1147,16 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     RegLog(dev, L"Log_Stage", 11);  /* RF/cal replayed */
 
     InterlockedExchange(&ctx->HwReady, 1);
+
+    /* Make sure the continuous reader is actually running (osrusbfx2 does the same):
+     * start the bulk-IN I/O target explicitly and log its state. */
+    {
+        WDFIOTARGET tgt = WdfUsbTargetPipeGetIoTarget(ctx->BulkIn);
+        RegLog(dev, L"Log_Rx_StateBefore", (ULONG)WdfIoTargetGetState(tgt));
+        st = WdfIoTargetStart(tgt);
+        RegLog(dev, L"Log_Rx_StartStatus", (ULONG)st);
+        RegLog(dev, L"Log_Rx_StateAfter", (ULONG)WdfIoTargetGetState(tgt));
+    }
     RegLog(dev, L"Log_Stage", 12);  /* hardware ready, scan starting */
     ScanStart(ctx);                 /* async: returns immediately */
     return STATUS_SUCCESS;
@@ -1162,6 +1175,7 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     WdfTimerStop(ctx->ScanTimer, TRUE);
     WdfWorkItemFlush(ctx->ScanWork);
     InterlockedExchange(&ctx->ScanRunning, 0);
+    if (ctx->BulkIn) WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(ctx->BulkIn), WdfIoTargetCancelSentIo);
     RegLog(dev, L"Log_D0Exit_Count", ctx->D0Count);
     RegLog(dev, L"Log_D0Exit_Target", (ULONG)target);
     return STATUS_SUCCESS;

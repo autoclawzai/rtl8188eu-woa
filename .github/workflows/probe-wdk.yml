@@ -6,27 +6,21 @@ on:
 jobs:
   probe:
     runs-on: windows-2022
-    strategy:
-      fail-fast: false
-      matrix:
-        file: [ 'wificx\1.0\wificx.h', 'wificx\1.0\wificxtypes.h', 'wlan\1.0\TlvGeneratorParser.hpp', 'wlan\1.0\arrayofelements.hpp' ]
     steps:
-      - name: Dump compacted header
+      - name: Toolset NetAdapter/WiFi references
         shell: pwsh
         run: |
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-          $t = Get-Content (Join-Path $kits '${{ matrix.file }}') -Raw
-          $t = [regex]::Replace($t, '/\*.*?\*/', '', 'Singleline')
-          $t = [regex]::Replace($t, '//[^\r\n]*', '')
-          $t = [regex]::Replace($t, '[ \t]+', ' ')
-          $t = [regex]::Replace($t, '(\r?\n\s*)+', "`n")
-          $t = $t -replace '`','' -replace '%','%25' -replace "`r",'' 
-          $name = '${{ matrix.file }}'.Replace('\','_')
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dirs = Get-ChildItem "$vs\MSBuild\Microsoft\VC" -Recurse -Directory -Filter "WindowsKernelModeDriver10.0" | Select-Object -First 1
+          $files = Get-ChildItem $dirs.Parent.Parent.FullName -Recurse -File -Include *.props,*.targets,*.xml -ErrorAction SilentlyContinue
+          $hits = $files | Select-String -Pattern 'NetAdapter|WiFiCx|Wificx|NETADAPTER' -List | ForEach-Object { $_.Path.Substring($vs.Length) + ':' + $_.LineNumber + ' ' + $_.Line.Trim() }
+          $line = ($hits | Select-Object -First 60) -join ' ;; '
           $i = 0
-          while ($t.Length -gt 0 -and $i -lt 9) {
-            $n = [Math]::Min(3600, $t.Length)
-            $chunk = $t.Substring(0,$n).Replace("`n",'%0A')
-            Write-Host "::notice title=$name#$i::$chunk"
-            $t = $t.Substring($n); $i++
+          while ($line.Length -gt 0 -and $i -lt 8) {
+            $n = [Math]::Min(3500, $line.Length)
+            Write-Host "::notice title=hits$i::$($line.Substring(0,$n))"
+            $line = $line.Substring($n); $i++
           }
-          if ($t.Length -gt 0) { Write-Host "::warning title=$name::truncated, $($t.Length) chars left" }
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $ext = Get-ChildItem "$kits\build" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NetAdapter|WiFi|wificx' } | ForEach-Object { $_.FullName.Substring($kits.Length) }
+          Write-Host "::notice title=kitsbuild::$($ext -join ' ; ')"

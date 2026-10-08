@@ -21,11 +21,15 @@ jobs:
                 $text = $text.Substring($n); $i++
               }
             }
-            $f = "$root\TlvGenerated_.hpp"
+            $km = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
             $out = @()
-            foreach ($name in 'WDI_SIGNAL_INFO_CONTAINER','WDI_CHANNEL_INFO_CONTAINER','WDI_AGE_INFO_CONTAINER') {
-              $sel = Select-String -Path $f -Pattern ('\b' + $name + '\b') | Select-Object -First 3
-              foreach ($x in $sel) { $out += ($name + ' @' + $x.LineNumber + ': ' + $x.Line.Trim()) }
+            $files = Get-ChildItem $km -Recurse -File -Include dot11wificx*.h,dot11wificx*.hpp,*.h -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan' }
+            foreach ($file in $files) {
+              $raw = Get-Content $file.FullName -Raw
+              foreach ($n in 'WDI_SIGNAL_INFO','WDI_BSS_ENTRY_CHANNEL_INFO','WDI_BSS_ENTRY_AGE_INFO','WDI_BAND_ID','WDI_CHANNEL_MAPPING_ENTRY') {
+                $m = [regex]::Match($raw, 'typedef\s+(struct|enum)\s+_?' + $n + '\b[\s\S]*?\}\s*' + $n + '\b[^;]*;')
+                if ($m.Success) { $out += ('## ' + $file.Name + ': ' + ($m.Value -replace '\s+',' ')) }
+              }
             }
-            Emit "grep" ($out -join "`n")
+            Emit "defs" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

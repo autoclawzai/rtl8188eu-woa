@@ -34,10 +34,8 @@ jobs:
 
             $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
             $out = @()
-            $all = Get-ChildItem $root -Recurse -File -Include *.h,*.hpp -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan' }
-            foreach ($f in $all) {
-              $sel = Select-String -Path $f.FullName -Pattern '^\s*\}\s*(WDI_BYTE_BLOB|WDI_SIGNAL_INFO_CONTAINER|WDI_CHANNEL_INFO_CONTAINER|WDI_MAC_ADDRESS_CONTAINER|WDI_AGE_INFO_CONTAINER|WDI_SSID)\b' -Context 14,0
-              foreach ($x in $sel) { $out += ('#### ' + $f.Name); $out += ((($x.Context.PreContext + $x.Line) -join ' ') -replace '\s+',' ') }
-            }
-            Emit "defs" ($out -join "`n")
+            $f = "$root\wlan\2.0\TlvGenerated_.hpp"
+            $sel = Select-String -Path $f -Pattern 'WDI_SIGNAL_INFO_CONTAINER|WDI_CHANNEL_INFO_CONTAINER|WDI_AGE_INFO_CONTAINER|WDI_MAC_ADDRESS_CONTAINER|WDI_BYTE_BLOB' | Select-Object -First 12
+            foreach ($x in $sel) { $out += ($x.LineNumber.ToString() + ': ' + $x.Line.Trim()) }
+            Emit "grep" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

@@ -33,15 +33,11 @@ jobs:
             }
 
             $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-            $names = @('WDI_BYTE_BLOB','WDI_SIGNAL_INFO_CONTAINER','WDI_CHANNEL_INFO_CONTAINER','WDI_MAC_ADDRESS_CONTAINER','WDI_AGE_INFO_CONTAINER','WDI_MAC_ADDRESS','WDI_SSID')
             $out = @()
             $all = Get-ChildItem $root -Recurse -File -Include *.h,*.hpp -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan' }
             foreach ($f in $all) {
-              $raw = Get-Content $f.FullName -Raw
-              foreach ($n in $names) {
-                $m = [regex]::Match($raw, '(typedef\s+)?struct\s+_?' + $n + '\b\s*\{[\s\S]*?\}\s*(' + $n + '\b[^;]*)?;')
-                if ($m.Success) { $out += ('#### ' + $f.Name + ' ' + $n); $out += (($m.Value -replace '\s+',' ')) }
-              }
+              $sel = Select-String -Path $f.FullName -Pattern '^\s*\}\s*(WDI_BYTE_BLOB|WDI_SIGNAL_INFO_CONTAINER|WDI_CHANNEL_INFO_CONTAINER|WDI_MAC_ADDRESS_CONTAINER|WDI_AGE_INFO_CONTAINER|WDI_SSID)\b' -Context 14,0
+              foreach ($x in $sel) { $out += ('#### ' + $f.Name); $out += ((($x.Context.PreContext + $x.Line) -join ' ') -replace '\s+',' ') }
             }
             Emit "defs" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

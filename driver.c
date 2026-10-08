@@ -29,6 +29,7 @@
 #include <ntstrsafe.h>
 
 #include "wifi.h"
+#include "rtl_bss.h"
 #include "fwdata.h"
 #include "inittab.h"
 #include "inittab2.h"
@@ -89,14 +90,7 @@
 #define SCAN_DIRECTED_MS    100
 enum { SCAN_PASSIVE = 1, SCAN_ACTIVE = 2, SCAN_DIRECTED = 3 };
 
-typedef struct _BSS_ENTRY {
-    UCHAR  Bssid[6];
-    UCHAR  Ssid[33];
-    UCHAR  Ch;
-    UCHAR  RxCh;
-    ULONG  Hits;
-    ULONG  Resp;                            /* probe responses seen */
-} BSS_ENTRY;
+
 
 typedef struct _DEVICE_CONTEXT {
     void           *WdfTriageInfoPtr;       /* MUST be first: NetAdapterCx crash-dump carving */
@@ -137,6 +131,7 @@ typedef struct _DEVICE_CONTEXT {
     ULONG64         RxBytes;
     ULONG           ReaderFails;
     ULONG           D0Count, ScanRuns;
+    volatile LONG   FastScan;               /* 1 = scan requested by Windows (shorter dwells) */
     BSS_ENTRY       Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -495,34 +490,84 @@ static NTSTATUS Rtl_SetChannel(PDEVICE_CONTEXT c, UCHAR ch)
 
 /* ---- phase 4a: passive scan over bulk-IN ---------------------------------- */
 
-static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh, BOOLEAN isResp)
+/* RSSI (dBm) from the RX descriptor PHY status (drvinfo). Formulas follow the Realtek reference
+ * driver / rtl8xxxu: CCK uses the AGC report (LNA/VGA index), OFDM/HT uses pwdb_all. */
+static LONG Rx_Rssi(const UCHAR *phy, ULONG rate)
 {
-    ULONG i;
-    if (ssidLen > 32) ssidLen = 32;
-    for (i = 0; i < c->BssCount; i++) {
-        if (RtlCompareMemory(c->Bss[i].Bssid, bssid, 6) == 6) {
-            c->Bss[i].Hits++;
-            if (isResp) c->Bss[i].Resp++;
-            /* hidden AP: beacon has empty/zeroed SSID, probe response carries the real one */
-            if (c->Bss[i].Ssid[0] == 0 && ssidLen > 0 && ssid[0] != 0) {
-                RtlCopyMemory(c->Bss[i].Ssid, ssid, ssidLen);
-                c->Bss[i].Ssid[ssidLen] = 0;
-            }
-            return;
+    LONG pwr;
+    if (rate <= 3) {                                   /* CCK 1/2/5.5/11 */
+        UCHAR agc = phy[0];
+        LONG lna = (agc & 0xE0) >> 5, vga = agc & 0x1F;
+        switch (lna) {
+        case 7:  pwr = (vga <= 27) ? -100 + 2 * (27 - vga) : -100; break;
+        case 6:  pwr = -48 + 2 * (2 - vga); break;
+        case 5:  pwr = -42 + 2 * (7 - vga); break;
+        case 4:  pwr = -36 + 2 * (7 - vga); break;
+        case 3:  pwr = -24 + 2 * (7 - vga); break;
+        case 2:  pwr = -12 + 2 * (5 - vga); break;
+        case 1:  pwr = 8 - 2 * vga; break;
+        default: pwr = 14 - 2 * vga; break;
         }
+        pwr += 6;
+    } else {
+        pwr = (LONG)((phy[1] >> 1) & 0x7F) - 110;
     }
-    if (c->BssCount >= RTL_MAX_BSS) return;
-    RtlCopyMemory(c->Bss[i].Bssid, bssid, 6);
-    RtlCopyMemory(c->Bss[i].Ssid, ssid, ssidLen);
-    c->Bss[i].Ssid[ssidLen] = 0;
-    c->Bss[i].Ch = bssCh;
-    c->Bss[i].RxCh = rxCh;
-    c->Bss[i].Hits = 1;
-    c->Bss[i].Resp = isResp ? 1 : 0;
-    c->BssCount++;
+    if (pwr > -10) pwr = -10;
+    if (pwr < -100) pwr = -100;
+    return pwr;
 }
 
-static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHAR rxCh)
+static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh,
+                        BOOLEAN isResp, const UCHAR *body, ULONG bodyLen, LONG rssi)
+{
+    ULONG i;
+    BSS_ENTRY *e;
+    ULONG keep = 0, o = 0;
+
+    if (ssidLen > 32) ssidLen = 32;
+
+    /* how much of the body we can keep: whole IEs only */
+    if (bodyLen >= 12) {
+        o = 12;
+        while (o + 2 <= bodyLen && o + 2 + body[o + 1] <= bodyLen && o + 2 + body[o + 1] <= BSS_BODY_MAX) o += 2 + body[o + 1];
+        keep = o;
+    }
+
+    for (i = 0; i < c->BssCount; i++) {
+        if (RtlCompareMemory(c->Bss[i].Bssid, bssid, 6) == 6) break;
+    }
+    if (i == c->BssCount) {
+        if (c->BssCount >= RTL_MAX_BSS) return;
+        e = &c->Bss[i];
+        RtlCopyMemory(e->Bssid, bssid, 6);
+        RtlCopyMemory(e->Ssid, ssid, ssidLen);
+        e->Ssid[ssidLen] = 0;
+        e->Ch = bssCh;
+        e->RxCh = rxCh;
+        c->BssCount++;
+    } else {
+        e = &c->Bss[i];
+        /* hidden AP: beacon has empty/zeroed SSID, probe response carries the real one */
+        if (e->Ssid[0] == 0 && ssidLen > 0 && ssid[0] != 0) {
+            RtlCopyMemory(e->Ssid, ssid, ssidLen);
+            e->Ssid[ssidLen] = 0;
+        }
+        if (e->Ch == 0) e->Ch = bssCh;
+    }
+    e->Hits++;
+    if (isResp) e->Resp++;
+
+    /* keep the probe response body in preference to a beacon; otherwise latest frame wins */
+    if (keep && (e->BodyLen == 0 || isResp || !e->BodyIsResp)) {
+        RtlCopyMemory(e->Body, body, keep);
+        e->BodyLen = (USHORT)keep;
+        e->BodyIsResp = isResp ? 1 : 0;
+    }
+    e->Rssi = rssi;
+    e->Lq = (UCHAR)((rssi <= -90) ? 10 : (rssi >= -40) ? 100 : (10 + (rssi + 90) * 90 / 50));
+}
+
+static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHAR rxCh, LONG rssi)
 {
     UCHAR type, subtype, ch = 0, ssidLen = 0;
     const UCHAR *ssid = (const UCHAR *)"";
@@ -546,7 +591,7 @@ static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHA
         else if (id == 3 && l >= 1) ch = p[2];
         p += 2 + l;
     }
-    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh, (BOOLEAN)(subtype == 5));
+    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh, (BOOLEAN)(subtype == 5), f + 24, len - 24, rssi);
 }
 
 static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCHAR rxCh)
@@ -554,6 +599,7 @@ static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCH
     ULONG off = 0;
     while (off + RX_DESC_LEN <= len) {
         ULONG v0 = *(const ULONG *)(buf + off);
+        ULONG v3 = *(const ULONG *)(buf + off + 12);
         ULONG pktLen = v0 & 0x3FFF;
         ULONG drvInfo = ((v0 >> 16) & 0xF) * 8;
         ULONG shift = (v0 >> 24) & 3;
@@ -561,7 +607,12 @@ static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCH
         ULONG adv;
         if (pktLen == 0 || off + hdr + pktLen > len) break;
         if (v0 & 0xC000) c->ScanBadCrc++;             /* CRC32 / ICV error */
-        else Scan_ProcessFrame(c, buf + off + hdr, pktLen, rxCh);
+        else {
+            LONG rssi = -80;
+            if (drvInfo >= 2 && (v0 & (1u << 26)))      /* PHY status present */
+                rssi = Rx_Rssi(buf + off + RX_DESC_LEN, v3 & 0x3F);
+            Scan_ProcessFrame(c, buf + off + hdr, pktLen, rxCh, rssi);
+        }
         adv = (hdr + pktLen + 127) & ~127u;            /* entries are 128-byte aligned */
         off += adv;
     }
@@ -724,11 +775,13 @@ static NTSTATUS Rtl_SendProbe(PDEVICE_CONTEXT c, UCHAR ch, const UCHAR *ssid, UC
 static VOID LogBssList(WDFDEVICE dev, PDEVICE_CONTEXT c)
 {
     ULONG bi, n;
-    BSS_ENTRY snap[RTL_MAX_BSS];   /* copy under lock, registry calls must run unlocked */
+    BSS_ENTRY *snap;   /* copy under lock, registry calls must run unlocked */
 
+    snap = (BSS_ENTRY *)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(BSS_ENTRY) * RTL_MAX_BSS, 'ssBR');
+    if (!snap) return;
     WdfSpinLockAcquire(c->BssLock);
     n = c->BssCount;
-    RtlCopyMemory(snap, c->Bss, sizeof(snap));
+    RtlCopyMemory(snap, c->Bss, sizeof(BSS_ENTRY) * n);
     WdfSpinLockRelease(c->BssLock);
 
     for (bi = 0; bi < n; bi++) {
@@ -745,6 +798,7 @@ static VOID LogBssList(WDFDEVICE dev, PDEVICE_CONTEXT c)
                 (ULONG)snap[bi].Ch, (ULONG)snap[bi].RxCh, snap[bi].Hits, snap[bi].Resp)))
             RegLogStr(dev, name, val);
     }
+    ExFreePoolWithTag(snap, 'ssBR');
 }
 
 /* ---- phase 5a: RX via WDF continuous reader ------------------------------ */
@@ -827,7 +881,7 @@ static ULONG ScanStep(PDEVICE_CONTEXT c)
             st = ScanHop(c, (UCHAR)c->ScanCh, FALSE);
             if (!NT_SUCCESS(st)) { c->ScanStatus = st; return 0; }
             c->ScanCh++;
-            return SCAN_PASSIVE_MS;
+            return c->FastScan ? 130 : SCAN_PASSIVE_MS;
 
         case SCAN_ACTIVE:
             if (c->ScanSub == 0) {
@@ -846,7 +900,7 @@ static ULONG ScanStep(PDEVICE_CONTEXT c)
                 if (!ScanProbe(c, (UCHAR)c->ScanCh, NULL, 0)) { c->ScanStatus = c->TxFirstErr; return 0; }
                 c->ScanSub = 0;
             }
-            return SCAN_ACTIVE_MS;
+            return c->FastScan ? 60 : SCAN_ACTIVE_MS;
 
         case SCAN_DIRECTED:
             while (TRUE) {
@@ -871,7 +925,7 @@ static ULONG ScanStep(PDEVICE_CONTEXT c)
                 st = ScanHop(c, ch, TRUE);
                 if (!NT_SUCCESS(st)) { c->ScanStatus = st; return 0; }
                 if (NT_SUCCESS(Rtl_SendProbe(c, ch, ssid, n))) c->DirSent++;
-                return SCAN_DIRECTED_MS;
+                return c->FastScan ? 80 : SCAN_DIRECTED_MS;
             }
 
         default:
@@ -911,6 +965,8 @@ static VOID ScanFinish(WDFDEVICE dev, PDEVICE_CONTEXT c)
     LogBssList(dev, c);
     LOG("scan done st=0x%08x tx ok=%lu fail=%lu probe_resp=%lu", c->ScanStatus, c->TxOk, c->TxFail, sn[2][3]);
     if (NT_SUCCESS(c->ScanStatus)) RegLog(dev, L"Log_Stage", 13);   /* all scan phases finished */
+    c->FastScan = 0;
+    WifiCx_OnScanComplete(dev);          /* answers a pending WDI scan task (if any) */
     InterlockedExchange(&c->ScanRunning, 0);
 }
 
@@ -926,10 +982,10 @@ VOID EvtScanWork(WDFWORKITEM wi)
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     ULONG delay;
 
-    if (c->ScanCancel || !c->HwReady) { InterlockedExchange(&c->ScanRunning, 0); return; }
+    if (c->ScanCancel || !c->HwReady) { WifiCx_OnScanComplete(dev); InterlockedExchange(&c->ScanRunning, 0); return; }
     delay = ScanStep(c);
     if (delay == 0) { ScanFinish(dev, c); return; }
-    if (c->ScanCancel) { InterlockedExchange(&c->ScanRunning, 0); return; }
+    if (c->ScanCancel) { WifiCx_OnScanComplete(dev); InterlockedExchange(&c->ScanRunning, 0); return; }
     WdfTimerStart(c->ScanTimer, WDF_REL_TIMEOUT_IN_MS(delay));
 }
 
@@ -951,6 +1007,28 @@ static VOID ScanStart(PDEVICE_CONTEXT c)
     c->ScanRuns++;
     InterlockedExchange(&c->ScanCancel, 0);
     WdfWorkItemEnqueue(c->ScanWork);
+}
+
+/* ---- exported to wifi.cpp ------------------------------------------------ */
+
+NTSTATUS Rtl_WifiScanRequest(WDFDEVICE dev)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    if (!c->HwReady) return STATUS_DEVICE_NOT_READY;
+    c->FastScan = 1;
+    ScanStart(c);                                /* joins a scan that is already running */
+    return STATUS_SUCCESS;
+}
+
+ULONG Rtl_SnapshotBss(WDFDEVICE dev, BSS_ENTRY *out, ULONG max)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    ULONG n;
+    WdfSpinLockAcquire(c->BssLock);
+    n = c->BssCount < max ? c->BssCount : max;
+    RtlCopyMemory(out, c->Bss, sizeof(BSS_ENTRY) * n);
+    WdfSpinLockRelease(c->BssLock);
+    return n;
 }
 
 /* ---- driver ------------------------------------------------------------ */

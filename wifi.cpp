@@ -39,6 +39,12 @@ inline void* operator new(size_t, void* p) noexcept { return p; }
 inline void  operator delete(void*, void*) noexcept {}
 
 void* __cdecl operator new(size_t size) noexcept { return WifiAlloc(size); }
+void* __cdecl operator new[](size_t size) noexcept { return WifiAlloc(size); }
+void* __cdecl operator new[](size_t size, ULONG_PTR ctx) noexcept
+{
+    if (ctx != 0) return operator new(size, ctx);
+    return WifiAlloc(size);
+}
 
 void* __cdecl operator new(size_t size, ULONG_PTR ctx) noexcept
 {
@@ -69,6 +75,8 @@ typedef struct _WIFI_CTX {
     BOOLEAN     SoftwareRadioOn;
     LONG        CmdCount;
     LONG        LastMsgId;
+    volatile LONG ScanPending;      /* a WDI scan task waits for its M4 */
+    WDI_MESSAGE_HEADER ScanHdr;     /* header of that task */
 } WIFI_CTX, *PWIFI_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WIFI_CTX, GetWifiCtx)
@@ -173,10 +181,21 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         SendM4(Device, WDI_INDICATION_DOT11_RESET_COMPLETE, hdr, STATUS_SUCCESS);
         return;
 
-    case WDI_TASK_SCAN:   /* 5b: no results yet; 5c wires this to the real scan engine */
-        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
-        SendM4(Device, WDI_INDICATION_SCAN_COMPLETE, hdr, STATUS_SUCCESS);
+    case WDI_TASK_SCAN: {
+        /* 5c: SSID/channel filters are ignored for now, we always scan all 13 channels */
+        if (InterlockedCompareExchange(&ctx->ScanPending, 1, 0) != 0) {
+            WifiRequestComplete(Request, STATUS_INVALID_DEVICE_STATE, sizeof(WDI_MESSAGE_HEADER));
+            return;
+        }
+        ctx->ScanHdr = hdr;
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));      /* M3 */
+        NTSTATUS st = Rtl_WifiScanRequest(Device);
+        WLog(Device, L"Log_Wifi_ScanReq", (ULONG)st);
+        if (!NT_SUCCESS(st)) {                       /* radio not up: finish right away */
+            WifiCx_OnScanComplete(Device);
+        }
         return;
+    }
 
     case WDI_TASK_DISCONNECT:
         WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
@@ -187,6 +206,55 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         WifiRequestComplete(Request, STATUS_NOT_SUPPORTED, sizeof(WDI_MESSAGE_HEADER));
         return;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* scan results -> WDI                                                 */
+/* ------------------------------------------------------------------ */
+static VOID IndicateBss(WDFDEVICE Device, PWIFI_CTX ctx, const BSS_ENTRY& b)
+{
+    if (b.BodyLen < 12) return;                      /* no usable frame body */
+
+    WDI_INDICATION_BSS_ENTRY_LIST_PARAMETERS p;
+    p.DeviceDescriptor.AllocateElements(1, 0);
+    if (p.DeviceDescriptor.ElementCount != 1) return;
+    p.Optional.DeviceDescriptor_IsPresent = 1;
+
+    WDI_BSS_ENTRY_CONTAINER& e = p.DeviceDescriptor.pElements[0];
+    RtlCopyMemory(e.BSSID.Address, b.Bssid, 6);
+    if (b.BodyIsResp) {
+        e.Optional.ProbeResponseFrame_IsPresent = 1;
+        e.ProbeResponseFrame.SimpleAssign(const_cast<UINT8*>(b.Body), b.BodyLen);
+    } else {
+        e.Optional.BeaconFrame_IsPresent = 1;
+        e.BeaconFrame.SimpleAssign(const_cast<UINT8*>(b.Body), b.BodyLen);
+    }
+    e.SignalInfo.RSSI = b.Rssi;
+    e.SignalInfo.LinkQuality = b.Lq;
+    e.ChannelInfo.ChannelNumber = b.Ch ? b.Ch : b.RxCh;
+    e.ChannelInfo.BandId = WDI_BAND_ID_2400;
+
+    UINT8* out = nullptr;
+    ULONG cb = 0;
+    if (GenerateWdiIndicationBssEntryList(&p, 0, &ctx->Tlv, &cb, &out) == 0) {
+        SendIndication(Device, ctx->ScanHdr, WDI_INDICATION_BSS_ENTRY_LIST, 0, STATUS_SUCCESS, out, cb);
+        FreeGenerated(out);
+    }
+}
+
+extern "C" VOID WifiCx_OnScanComplete(WDFDEVICE Device)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    if (InterlockedCompareExchange(&ctx->ScanPending, 0, 1) != 1) return;   /* nobody is waiting */
+
+    BSS_ENTRY* snap = (BSS_ENTRY*)WifiAlloc(sizeof(BSS_ENTRY) * 24);
+    ULONG n = 0;
+    if (snap) n = Rtl_SnapshotBss(Device, snap, 24);
+    for (ULONG i = 0; i < n; i++) IndicateBss(Device, ctx, snap[i]);
+    if (snap) ExFreePoolWithTag(snap, WIFI_POOL_TAG);
+
+    WLog(Device, L"Log_Wifi_ScanIndicated", n);
+    SendM4(Device, WDI_INDICATION_SCAN_COMPLETE, ctx->ScanHdr, STATUS_SUCCESS);
 }
 
 /* ------------------------------------------------------------------ */

@@ -80,6 +80,8 @@ typedef struct _WIFI_CTX {
     UCHAR       Bssid[6];
     BOOLEAN     Connected;
     UCHAR       ConnChannel;
+    UCHAR       ConnBeacon[640];
+    ULONG       ConnBeaconLen;
     /* RX ring: Ethernet frames waiting for the NetAdapter rx queue (producer = USB completion, DISPATCH) */
     KSPIN_LOCK  RxLock;
     NETPACKETQUEUE RxQueue;
@@ -248,6 +250,12 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
             o += 2 + l;
         }
 
+        ctx->ConnBeaconLen = 0;
+        if (body && bl && bl <= sizeof(ctx->ConnBeacon)) {
+            RtlCopyMemory(ctx->ConnBeacon, body, bl);
+            ctx->ConnBeaconLen = bl;
+        }
+
         UCHAR ext[256]; ULONG extLen = 0;
         if (p.ConnectParameters.Optional.AssociationRequestVendorIE_IsPresent) {
             extLen = p.ConnectParameters.AssociationRequestVendorIE.ElementCount;
@@ -372,6 +380,12 @@ extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT
                 r.Optional.AssociationResponseFrame_IsPresent = 1;
                 r.AssociationResponseFrame.SimpleAssign(const_cast<UINT8*>(AssocResp), AssocRespLen);
             }
+            if (ctx->ConnBeaconLen) {
+                r.Optional.BeaconProbeResponse_IsPresent = 1;
+                r.BeaconProbeResponse.SimpleAssign(ctx->ConnBeacon, ctx->ConnBeaconLen);
+            }
+            WDI_PHY_TYPE phys[2] = { (WDI_PHY_TYPE)6 /* ERP */, (WDI_PHY_TYPE)7 /* HT */ };
+            r.ActivePhyTypeList.SimpleAssign(phys, 2);
             UINT8* out = nullptr; ULONG cb = 0;
             NDIS_STATUS g = GenerateWdiIndicationAssociationResultFromIhv(&list, 0, &ctx->Tlv, &cb, &out);
             WLog(Device, L"Log_Wifi_AssocResultGen", (ULONG)g);

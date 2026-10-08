@@ -23,19 +23,11 @@ jobs:
               }
             }
             function Ctx([string]$file, [string]$pattern, [int]$after, [int]$max) {
-              $sel = Select-String -Path $file -Pattern $pattern -Context 0,$after | Select-Object -First $max
-              $parts = @()
-              foreach ($s in $sel) {
-                $t = ($s.Line + ' ' + ($s.Context.PostContext -join ' ')) -replace '\s+',' '
-                $parts += ('@@ ' + $t.Trim())
-              }
-              return ($parts -join "`n")
+              foreach ($pat in 'WDI_SIGNAL_INFO_CONTAINER;','WDI_CHANNEL_INFO_CONTAINER;','WDI_AGE_INFO_CONTAINER;') {
+              $sel = Select-String -Path $f -Pattern ('\}\s*' + $pat.TrimEnd(';') + '\b') -Context 12,0 | Select-Object -First 1
+              foreach ($x in $sel) { $out += ((($x.Context.PreContext + $x.Line) -join ' ') -replace '\s+',' ') }
+              $sel2 = Select-String -Path $f -Pattern ('typedef\s+.*' + $pat.TrimEnd(';')) | Select-Object -First 2
+              foreach ($x in $sel2) { $out += ('TD: ' + $x.Line.Trim()) }
             }
-
-            $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
-            $out = @()
-            $f = "$root\wlan\2.0\TlvGenerated_.hpp"
-            $sel = Select-String -Path $f -Pattern 'WDI_SIGNAL_INFO_CONTAINER|WDI_CHANNEL_INFO_CONTAINER|WDI_AGE_INFO_CONTAINER|WDI_MAC_ADDRESS_CONTAINER|WDI_BYTE_BLOB' | Select-Object -First 12
-            foreach ($x in $sel) { $out += ($x.LineNumber.ToString() + ': ' + $x.Line.Trim()) }
             Emit "grep" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

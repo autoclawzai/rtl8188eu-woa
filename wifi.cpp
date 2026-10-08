@@ -413,7 +413,8 @@ extern "C" NTSTATUS WifiCx_SetCapabilities(WDFDEVICE Device, const UCHAR Mac[6])
     bi.NumChannelWidths = 1;
     bi.ChannelWidthList = &g_Width20;
     WIFI_BAND_CAPABILITIES bc;
-    WIFI_BAND_CAPABILITIES_INIT(&bc);
+    RtlZeroMemory(&bc, sizeof(bc));
+    bc.Size = sizeof(bc);
     bc.NumBands = 1;
     bc.BandInfoList = &bi;
     st = WifiDeviceSetBandCapabilities(Device, &bc);
@@ -429,7 +430,8 @@ extern "C" NTSTATUS WifiCx_SetCapabilities(WDFDEVICE Device, const UCHAR Mac[6])
     phy[1].NumberDataRateEntries = ARRAYSIZE(g_RatesHt);
     RtlCopyMemory(phy[1].DataRateList, g_RatesHt, sizeof(g_RatesHt));
     WIFI_PHY_CAPABILITIES pc;
-    WIFI_PHY_CAPABILITIES_INIT(&pc);
+    RtlZeroMemory(&pc, sizeof(pc));
+    pc.Size = sizeof(pc);
     pc.NumPhyTypes = ARRAYSIZE(phy);
     pc.PhyInfoList = phy;
     st = WifiDeviceSetPhyCapabilities(Device, &pc);

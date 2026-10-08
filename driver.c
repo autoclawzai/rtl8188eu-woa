@@ -28,6 +28,7 @@
 #include <wdfusb.h>
 #include <ntstrsafe.h>
 
+#include "wifi.h"
 #include "fwdata.h"
 #include "inittab.h"
 #include "inittab2.h"
@@ -98,6 +99,7 @@ typedef struct _BSS_ENTRY {
 } BSS_ENTRY;
 
 typedef struct _DEVICE_CONTEXT {
+    void           *WdfTriageInfoPtr;       /* MUST be first: NetAdapterCx crash-dump carving */
     WDFUSBDEVICE    UsbDevice;
     WDFUSBINTERFACE UsbInterface;
     WDFUSBPIPE      BulkIn;
@@ -971,6 +973,9 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     NTSTATUS st;
     UNREFERENCED_PARAMETER(drv);
 
+    st = WifiCx_DeviceInitConfig(init);          /* NetDeviceInitConfig + WifiDeviceInitConfig */
+    if (!NT_SUCCESS(st)) return st;
+
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
     pnp.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
     pnp.EvtDeviceD0Entry = EvtDeviceD0Entry;
@@ -981,6 +986,10 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     st = WdfDeviceCreate(&init, &attr, &dev);
     if (!NT_SUCCESS(st)) return st;
     c = GetDeviceContext(dev);
+    c->WdfTriageInfoPtr = WdfGetTriageInfo();
+
+    st = WifiCx_DeviceInitialize(dev);           /* WifiDeviceInitialize */
+    if (!NT_SUCCESS(st)) return st;
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ParentObject = dev;
@@ -1089,7 +1098,12 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         RegLog(dev, L"Log_Stage", 6);   /* efuse parsed */
     }
     /* EFUSE failure is not fatal for the debug build: keep the device so logs can be read */
-    return STATUS_SUCCESS;
+
+    /* phase 5b: tell WiFiCx what this adapter can do (Log_Wifi_Cap* hold per-step status) */
+    st = WifiCx_SetCapabilities(dev, ctx->Mac);
+    RegLog(dev, L"Log_Wifi_Caps", (ULONG)st);
+    RegLog(dev, L"Log_Stage", 7);   /* wifi capabilities set */
+    return NT_SUCCESS(st) ? STATUS_SUCCESS : st;
 }
 
 /* D0Entry: full radio bring-up. Runs on first start and after every resume.

@@ -23,6 +23,12 @@
     <DriverTargetPlatform>Desktop</DriverTargetPlatform>
     <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
     <KMDF_VERSION_MINOR>33</KMDF_VERSION_MINOR>
+    <NetAdapterDriver>true</NetAdapterDriver>
+    <NETADAPTER_VERSION_MAJOR>2</NETADAPTER_VERSION_MAJOR>
+    <NETADAPTER_VERSION_MINOR>0</NETADAPTER_VERSION_MINOR>
+    <WifiDriver>true</WifiDriver>
+    <WIFI_VERSION_MAJOR>1</WIFI_VERSION_MAJOR>
+    <WIFI_VERSION_MINOR>0</WIFI_VERSION_MINOR>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings" />
@@ -35,10 +41,16 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <TreatWarningAsError>false</TreatWarningAsError>
+      <AdditionalIncludeDirectories>$(DDK_INC_PATH)wlan\2.0;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(DDK_LIB_PATH)wlan\2.0\WificxTLVGenParse.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="wifi.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="rtl8188eu.inf" />

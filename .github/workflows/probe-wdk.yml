@@ -21,15 +21,19 @@ jobs:
                 $text = $text.Substring($n); $i++
               }
             }
-            $km = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km"
+            $f = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0\TlvGenerated_.hpp"
+            $raw = Get-Content $f -Raw
+            $names = @('WDI_TASK_CONNECT_PARAMETERS','WDI_CONNECT_BSS_ENTRY_CONTAINER','WDI_INDICATION_ASSOCIATION_RESULT_PARAMETERS','WDI_ASSOCIATION_RESULT_CONTAINER','WDI_INDICATION_LINK_STATE_CHANGE_PARAMETERS','WDI_SET_ADD_CIPHER_KEYS_PARAMETERS','WDI_CIPHER_KEY_INFO_CONTAINER','WDI_TASK_DISCONNECT_PARAMETERS')
             $out = @()
-            $files = Get-ChildItem $km -Recurse -File -Include *.h,*.hpp -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'wificx|wlan' }
-            foreach ($file in $files) {
-              $raw = Get-Content $file.FullName -Raw
-              foreach ($n in 'WDI_SIGNAL_INFO','WDI_BSS_ENTRY_CHANNEL_INFO','WDI_BSS_ENTRY_AGE_INFO','WDI_CHANNEL_NUMBER') {
-                $m = [regex]::Match($raw, 'typedef\s+(struct|enum)\s+_?' + $n + '\b[\s\S]*?\}\s*' + $n + '\b[^;]*;')
-                if ($m.Success) { $out += ('## ' + $file.Name + ': ' + ($m.Value -replace '\s+',' ')) }
-              }
+            foreach ($n in $names) {
+              $m = [regex]::Match($raw, 'typedef\s+struct\s+_?' + $n + '\b[\s\S]*?\}\s*' + $n + '\b[^;]*;')
+              if ($m.Success) {
+                $t = $m.Value
+                $t = [regex]::Replace($t, '#ifdef __cplusplus[\s\S]*?#else[^\n]*\n[\s\S]*?#endif[^\n]*\n', '')   # array typedef pairs
+                $t = [regex]::Replace($t, '#ifdef __cplusplus[\s\S]*?#endif[^\n]*\n', '')
+                $t = [regex]::Replace($t, '//[^\n]*', '')
+                $out += ('## ' + $n + ': ' + ($t -replace '\s+',' '))
+              } else { $out += ('## ' + $n + ': NOT FOUND') }
             }
-            Emit "defs" ($out -join "`n")
+            Emit "structs" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

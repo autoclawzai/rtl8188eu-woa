@@ -32,11 +32,16 @@ jobs:
               return ($parts -join "`n")
             }
 
-            $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0"
-            $hits = Get-ChildItem $root -Recurse -File -Include *.h -ErrorAction SilentlyContinue | Select-String -Pattern 'NET_EUI48_ADDRESS' | Where-Object { $_.Line -match 'typedef|struct|define' } | Select-Object -First 12
-            Emit "eui48" (($hits | ForEach-Object { $_.Path.Replace($root,'') + ':' + $_.LineNumber + ': ' + $_.Line.Trim() }) -join "`n")
-            $f1 = Get-ChildItem $root -Recurse -File -Filter 'netiodef.h' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName.Replace($root,'') }
-            Emit "netiodef" ($f1 -join "`n")
-            $d = Get-ChildItem $root -Recurse -File -Filter 'ifdef.h' -ErrorAction SilentlyContinue | Select-Object -First 3
-            foreach ($x in $d) { Emit ("ifdef " + $x.FullName.Replace($root,'')) (Ctx $x.FullName 'NET_EUI48_ADDRESS' 3 6) }
+            $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0"
+            $files = Get-ChildItem $root -File -ErrorAction SilentlyContinue
+            Emit "files" (($files | ForEach-Object { $_.Name + ' ' + $_.Length }) -join "`n")
+            $names = @('WDI_INDICATION_BSS_ENTRY_LIST_PARAMETERS','WDI_BSS_ENTRY_CONTAINER','WDI_SCAN_PARAMETERS','WDI_SCAN_COMPLETE_PARAMETERS','WDI_INDICATION_SCAN_COMPLETE_PARAMETERS','WDI_BSS_ENTRY_CONTAINER_OPTIONAL_TLVS','WDI_CHANNEL_INFO')
+            foreach ($f in $files) {
+              if ($f.Extension -notin '.h','.hpp') { continue }
+              $raw = Get-Content $f.FullName -Raw
+              foreach ($n in $names) {
+                $m = [regex]::Match($raw, 'typedef\s+struct\s+_?' + $n + '\b[\s\S]*?\}\s*' + $n + '\b[^;]*;')
+                if ($m.Success) { Emit ("def " + $n) (($m.Value -replace '\s+',' ')) }
+              }
+            }
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

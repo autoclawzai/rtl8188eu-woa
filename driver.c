@@ -1346,6 +1346,11 @@ static VOID EvtTxWork(WDFWORKITEM wi)
         c->TxQTail++;
         WdfSpinLockRelease(c->TxQLock);
     }
+    RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
+    RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
+    RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
+    RegLog(dev, L"Log_Data_Rx", c->DataRx);
+    RegLog(dev, L"Log_Data_RxDrop", c->DataRxDrop);
 }
 
 /* ---- RX: management responses + data -> Ethernet ---- */

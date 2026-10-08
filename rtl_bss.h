@@ -11,6 +11,8 @@ typedef struct _BSS_ENTRY {
     UCHAR  RxCh;                    /* channel the radio was on when heard */
     UCHAR  BodyIsResp;              /* 1 = body is from a probe response, 0 = beacon */
     UCHAR  Lq;                      /* link quality 0..100 */
+    UCHAR  Rate;                    /* RX descriptor rate index (debug) */
+    UCHAR  Phy0, Phy1;              /* raw PHY status bytes (debug) */
     USHORT BodyLen;
     LONG   Rssi;                    /* dBm */
     ULONG  Hits;

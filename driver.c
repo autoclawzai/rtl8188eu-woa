@@ -518,7 +518,7 @@ static LONG Rx_Rssi(const UCHAR *phy, ULONG rate)
 }
 
 static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid, UCHAR ssidLen, UCHAR bssCh, UCHAR rxCh,
-                        BOOLEAN isResp, const UCHAR *body, ULONG bodyLen, LONG rssi)
+                        BOOLEAN isResp, const UCHAR *body, ULONG bodyLen, LONG rssi, const UCHAR *phyRaw)
 {
     ULONG i;
     BSS_ENTRY *e;
@@ -564,10 +564,11 @@ static VOID Scan_AddBss(PDEVICE_CONTEXT c, const UCHAR *bssid, const UCHAR *ssid
         e->BodyIsResp = isResp ? 1 : 0;
     }
     e->Rssi = rssi;
+    e->Rate = phyRaw[2]; e->Phy0 = phyRaw[0]; e->Phy1 = phyRaw[1];
     e->Lq = (UCHAR)((rssi <= -90) ? 10 : (rssi >= -40) ? 100 : (10 + (rssi + 90) * 90 / 50));
 }
 
-static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHAR rxCh, LONG rssi)
+static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHAR rxCh, LONG rssi, const UCHAR *phyRaw)
 {
     UCHAR type, subtype, ch = 0, ssidLen = 0;
     const UCHAR *ssid = (const UCHAR *)"";
@@ -591,7 +592,7 @@ static VOID Scan_ProcessFrame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, UCHA
         else if (id == 3 && l >= 1) ch = p[2];
         p += 2 + l;
     }
-    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh, (BOOLEAN)(subtype == 5), f + 24, len - 24, rssi);
+    Scan_AddBss(c, f + 16, ssid, ssidLen, ch, rxCh, (BOOLEAN)(subtype == 5), f + 24, len - 24, rssi, phyRaw);
 }
 
 static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCHAR rxCh)
@@ -609,9 +610,13 @@ static VOID Scan_ParseBuffer(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len, UCH
         if (v0 & 0xC000) c->ScanBadCrc++;             /* CRC32 / ICV error */
         else {
             LONG rssi = -80;
-            if (drvInfo >= 2 && (v0 & (1u << 26)))      /* PHY status present */
+            UCHAR raw[3] = {0, 0, 0};
+            raw[2] = (UCHAR)(v3 & 0x3F);
+            if (drvInfo >= 2 && (v0 & (1u << 26))) {    /* PHY status present */
+                raw[0] = buf[off + RX_DESC_LEN]; raw[1] = buf[off + RX_DESC_LEN + 1];
                 rssi = Rx_Rssi(buf + off + RX_DESC_LEN, v3 & 0x3F);
-            Scan_ProcessFrame(c, buf + off + hdr, pktLen, rxCh, rssi);
+            }
+            Scan_ProcessFrame(c, buf + off + hdr, pktLen, rxCh, rssi, raw);
         }
         adv = (hdr + pktLen + 127) & ~127u;            /* entries are 128-byte aligned */
         off += adv;
@@ -785,17 +790,17 @@ static VOID LogBssList(WDFDEVICE dev, PDEVICE_CONTEXT c)
     WdfSpinLockRelease(c->BssLock);
 
     for (bi = 0; bi < n; bi++) {
-        WCHAR name[24], val[112], ssw[34];
+        WCHAR name[24], val[176], ssw[34];
         ULONG k;
         for (k = 0; snap[bi].Ssid[k] && k < 32; k++)
             ssw[k] = (snap[bi].Ssid[k] >= 0x20 && snap[bi].Ssid[k] < 0x7F) ? (WCHAR)snap[bi].Ssid[k] : L'?';
         ssw[k] = 0;
         if (NT_SUCCESS(RtlStringCchPrintfW(name, 24, L"Scan_Bss%02u", bi)) &&
-            NT_SUCCESS(RtlStringCchPrintfW(val, 112, L"%ws | %02x:%02x:%02x:%02x:%02x:%02x | ch%u (heard on %u) | hits %lu | resp %lu",
+            NT_SUCCESS(RtlStringCchPrintfW(val, 176, L"%ws | %02x:%02x:%02x:%02x:%02x:%02x | ch%u (heard on %u) | hits %lu | resp %lu | rssi %ld rate %u phy %02x %02x",
                 ssw[0] ? ssw : L"<hidden>",
                 snap[bi].Bssid[0], snap[bi].Bssid[1], snap[bi].Bssid[2],
                 snap[bi].Bssid[3], snap[bi].Bssid[4], snap[bi].Bssid[5],
-                (ULONG)snap[bi].Ch, (ULONG)snap[bi].RxCh, snap[bi].Hits, snap[bi].Resp)))
+                (ULONG)snap[bi].Ch, (ULONG)snap[bi].RxCh, snap[bi].Hits, snap[bi].Resp, snap[bi].Rssi, (ULONG)snap[bi].Rate, (ULONG)snap[bi].Phy0, (ULONG)snap[bi].Phy1)))
             RegLogStr(dev, name, val);
     }
     ExFreePoolWithTag(snap, 'ssBR');

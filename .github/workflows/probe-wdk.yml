@@ -24,13 +24,11 @@ jobs:
             $f = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0\TlvGenerated_.hpp"
             $raw = (Get-ChildItem $root -Include *.h,*.hpp -Recurse | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
             $out = @()
-            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_PHY_TYPE_LIST_CONTAINER\b[\s\S]*?\}\s*WDI_PHY_TYPE_LIST_CONTAINER\b[^;]*;')
-            $out += ('## PHYLIST: ' + ($m.Value -replace '\s+',' '))
-            $names = [regex]::Matches($raw,'\bWDI_PHY_TYPE_[A-Z0-9_]+') | ForEach-Object { $_.Value } | Sort-Object -Unique
-            $out += ('## PHYNAMES: ' + ($names -join ' '))
-            $m = [regex]::Match($raw, 'typedef\s+(struct|enum)[^;{]*\{[^}]*\}\s*WDI_PHY_TYPE\b[^;]*;')
-            $out += ('## PHYTYPE: ' + ($m.Value -replace '\s+',' '))
-            $names = [regex]::Matches($raw,'\bWDI_(AUTH_ALGO|CIPHER_ALGO|ASSOC_STATUS|DS_INFO)[A-Z0-9_]*') | ForEach-Object { $_.Value } | Sort-Object -Unique
-            $out += ('## ENUMS: ' + ($names -join ' '))
+            $lines = $raw -split "`n"
+            for ($i=0; $i -lt $lines.Length; $i++) {
+              if ($lines[$i] -match 'WDI_PHY_TYPE_CONTAINER|WDI_PHY_TYPE_LIST_CONTAINER') {
+                $out += ('## L' + $i + ': ' + (($lines[[Math]::Max(0,$i-4)..([Math]::Min($lines.Length-1,$i+3))] -join ' ') -replace '\s+',' '))
+              }
+            }
             Emit "structs" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

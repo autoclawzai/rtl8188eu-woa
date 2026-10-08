@@ -155,7 +155,8 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      TxPipeData;             /* bulk OUT for BE queue (second out endpoint) */
     WDFWAITLOCK     TxLock;                 /* serialises TxDataBuf users */
     WDFSPINLOCK     TxQLock;
-    WDFWORKITEM     JoinWork, LossWork, TxWork;
+    WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork;
+    WDFTIMER        StatsTimer;
     KEVENT          JoinEvent;
     volatile LONG   JoinState;
     volatile LONG   JoinJob;
@@ -1282,6 +1283,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Join_HwUp", (ULONG)st);
     if (!NT_SUCCESS(st)) return st;
     InterlockedExchange(&c->JoinState, JOIN_UP);
+    WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     return STATUS_SUCCESS;
 }
 
@@ -1316,6 +1318,37 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
     }
 }
 
+static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
+{
+    ULONG st[12] = {0};
+    static const PCWSTR nm[12] = { L"Log_Dp_TxQCreated", L"Log_Dp_RxQCreated", L"Log_Dp_TxAdv", L"Log_Dp_TxPkt",
+        L"Log_Dp_TxSubmitOk", L"Log_Dp_TxSubmitFail", L"Log_Dp_TxLastSt", L"Log_Dp_RxAdv", L"Log_Dp_RxArm",
+        L"Log_Dp_RxInd", L"Log_Dp_RxRingDrop", L"Log_Dp_RxNotify" };
+    ULONG i;
+    WifiCx_GetDataStats(dev, st, 12);
+    for (i = 0; i < 12; i++) RegLog(dev, nm[i], st[i]);
+    RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
+    RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
+    RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
+    RegLog(dev, L"Log_Data_Rx", c->DataRx);
+    RegLog(dev, L"Log_Data_RxDrop", c->DataRxDrop);
+    RegLog(dev, L"Log_Data_RxFrames", c->RxCallbacks);
+}
+
+VOID EvtStatsTimer(WDFTIMER timer)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext((WDFDEVICE)WdfTimerGetParentObject(timer));
+    WdfWorkItemEnqueue(c->StatsWork);
+}
+
+static VOID EvtStatsWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    LogDataStats(dev, c);
+    if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
+}
+
 static VOID EvtLossWork(WDFWORKITEM wi)
 {
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
@@ -1346,11 +1379,6 @@ static VOID EvtTxWork(WDFWORKITEM wi)
         c->TxQTail++;
         WdfSpinLockRelease(c->TxQLock);
     }
-    RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
-    RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
-    RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
-    RegLog(dev, L"Log_Data_Rx", c->DataRx);
-    RegLog(dev, L"Log_Data_RxDrop", c->DataRxDrop);
 }
 
 /* ---- RX: management responses + data -> Ethernet ---- */
@@ -1561,6 +1589,19 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     st = WdfSpinLockCreate(&attr, &c->TxQLock);
     if (!NT_SUCCESS(st)) return st;
 
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtStatsWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->StatsWork);
+    if (!NT_SUCCESS(st)) return st;
+    WDF_TIMER_CONFIG_INIT(&tcfg, EvtStatsTimer);
+    tcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfTimerCreate(&tcfg, &attr, &c->StatsTimer);
+    if (!NT_SUCCESS(st)) return st;
+
     WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtJoinWork);
     wcfg.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
@@ -1758,6 +1799,8 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     InterlockedExchange(&ctx->JoinState, 0);
     InterlockedExchange(&ctx->ScanCancel, 1);
     InterlockedExchange(&ctx->HwReady, 0);
+    WdfTimerStop(ctx->StatsTimer, TRUE);
+    WdfWorkItemFlush(ctx->StatsWork);
     WdfWorkItemFlush(ctx->JoinWork);
     WdfWorkItemFlush(ctx->LossWork);
     WdfWorkItemFlush(ctx->TxWork);

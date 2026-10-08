@@ -33,6 +33,9 @@ VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason);
 VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR *Da, const UCHAR *Sa, const UCHAR *EtherType,
                      const UCHAR *Payload, ULONG PayloadLen);
 
+/* phase 5d: stats (wifi.cpp -> driver.c registry log): out[0..11] */
+VOID WifiCx_GetDataStats(WDFDEVICE Device, ULONG *Out, ULONG Count);
+
 /* phase 5d: wifi.cpp -> driver.c */
 NTSTATUS Rtl_WifiConnect(WDFDEVICE Device, const UCHAR *Bssid, const UCHAR *Ssid, ULONG SsidLen, UCHAR Channel,
                          const UCHAR *ExtIe, ULONG ExtIeLen);

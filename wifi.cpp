@@ -99,6 +99,10 @@ typedef struct _QUEUE_CTX {
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 
 static WDFDEVICE g_WifiDevice;     /* one adapter per driver instance */
+/* data-path debug counters (logged from driver.c every 2 s while connected) */
+enum { ST_TXQ_CREATED, ST_RXQ_CREATED, ST_TX_ADV, ST_TX_PKT, ST_TX_SUBMIT_OK, ST_TX_SUBMIT_FAIL, ST_TX_LASTST,
+       ST_RX_ADV, ST_RX_ARM, ST_RX_IND, ST_RX_DROP, ST_RX_NOTIFY, ST_N };
+static volatile LONG g_St[ST_N];
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WIFI_CTX, GetWifiCtx)
 
@@ -449,9 +453,11 @@ static VOID EvtTxAdvance(NETPACKETQUEUE q)
     PQUEUE_CTX qc = GetQueueCtx(q);
     NET_RING_COLLECTION const* rings = NetTxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
+    InterlockedIncrement(&g_St[ST_TX_ADV]);
 
     while (NetPacketIteratorHasAny(&pi)) {
         NET_PACKET* pkt = NetPacketIteratorGetPacket(&pi);
+        InterlockedIncrement(&g_St[ST_TX_PKT]);
         if (!pkt->Ignore) {
             UCHAR tmp[1536];
             ULONG n = 0;
@@ -467,7 +473,11 @@ static VOID EvtTxAdvance(NETPACKETQUEUE q)
                 n += l;
                 NetFragmentIteratorAdvance(&fi);
             }
-            if (ok && n >= 14) (VOID)Rtl_TxEthernet(g_WifiDevice, tmp, n);
+            if (ok && n >= 14) {
+                NTSTATUS ts = Rtl_TxEthernet(g_WifiDevice, tmp, n);
+                if (NT_SUCCESS(ts)) InterlockedIncrement(&g_St[ST_TX_SUBMIT_OK]);
+                else { InterlockedIncrement(&g_St[ST_TX_SUBMIT_FAIL]); InterlockedExchange(&g_St[ST_TX_LASTST], (LONG)ts); }
+            }
         }
         NetPacketIteratorAdvance(&pi);
     }
@@ -497,6 +507,7 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
     PQUEUE_CTX qc = GetQueueCtx(q);
     PWIFI_CTX w = qc->Wifi;
     NET_RING_COLLECTION const* rings = NetRxQueueGetRingCollection(q);
+    InterlockedIncrement(&g_St[ST_RX_ADV]);
 
     /* hand all buffers the OS posted to us */
     NET_RING_FRAGMENT_ITERATOR post = NetRingGetPostFragments(rings);
@@ -527,6 +538,7 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
             pkt->Layout.Layer2Type = NetPacketLayer2TypeEthernet;
             NetFragmentIteratorAdvance(&fi);
             NetPacketIteratorAdvance(&pi);
+            InterlockedIncrement(&g_St[ST_RX_IND]);
         } else {
             w->RxDropped++;
         }
@@ -541,6 +553,7 @@ static VOID EvtRxNotify(NETPACKETQUEUE q, BOOLEAN enabled)
 {
     PQUEUE_CTX qc = GetQueueCtx(q);
     InterlockedExchange(&qc->Wifi->RxNotifyArmed, enabled ? 1 : 0);
+    if (enabled) InterlockedIncrement(&g_St[ST_RX_ARM]);
 }
 
 static VOID EvtRxCancel(NETPACKETQUEUE q)
@@ -574,6 +587,7 @@ static NTSTATUS EvtCreateTxQueue(NETADAPTER, NETTXQUEUE_INIT* Init)
     NET_EXTENSION_QUERY_INIT(&query, NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_NAME,
                              NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1, NetExtensionTypeFragment);
     NetTxQueueGetExtension(q, &query, &qc->VaExt);
+    InterlockedIncrement(&g_St[ST_TXQ_CREATED]);
     return STATUS_SUCCESS;
 }
 
@@ -593,6 +607,7 @@ static NTSTATUS EvtCreateRxQueue(NETADAPTER, NETRXQUEUE_INIT* Init)
                              NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1, NetExtensionTypeFragment);
     NetRxQueueGetExtension(q, &query, &qc->VaExt);
     qc->Wifi->RxQueue = q;
+    InterlockedIncrement(&g_St[ST_RXQ_CREATED]);
     return STATUS_SUCCESS;
 }
 
@@ -620,7 +635,14 @@ extern "C" VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR* Da, const UCHAR* 
         w->RxDropped++;
     }
     KeReleaseSpinLock(&w->RxLock, irql);
-    if (q) NetRxQueueNotifyMoreReceivedPacketsAvailable(q);
+    if (q) { InterlockedIncrement(&g_St[ST_RX_NOTIFY]); NetRxQueueNotifyMoreReceivedPacketsAvailable(q); }
+}
+
+extern "C" VOID WifiCx_GetDataStats(WDFDEVICE Device, ULONG* Out, ULONG Count)
+{
+    PWIFI_CTX w = GetWifiCtx(Device);
+    for (ULONG i = 0; i < Count && i < ST_N; i++) Out[i] = (ULONG)g_St[i];
+    if (Count > ST_RX_DROP) Out[ST_RX_DROP] = w->RxDropped;
 }
 
 /* ------------------------------------------------------------------ */

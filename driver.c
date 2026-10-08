@@ -1,29 +1,3 @@
-    if (type == 2 && state == JOIN_UP) {
-        ULONG hdr = 24, end = len;
-        const UCHAR *llc;
-        c->RxType2++;
-        if (c->RxType2 == 1) { c->RxFirstFc = f[0] | (f[1] << 8); c->RxFirstV0 = v0; }
-        if ((fl & 3) != 2) { c->RxFlt[0]++; return; }                      /* only From-DS */
-        if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) { c->RxFlt[1]++; return; }
-        if (sub & 0x04) { c->RxFlt[2]++; return; }                         /* null / no-data subtypes */
-        if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) { c->RxFlt[3]++; return; }
-        if (sub & 0x08) hdr += 2;                           /* QoS control */
-        if ((fl & 0x80) && (sub & 0x08)) hdr += 4;          /* HT control */
-        if (fl & 0x40) {                                    /* protected: hw decrypted keeps CCMP hdr + MIC */
-            ULONG sec = (v0 >> 20) & 7, swdec = (v0 >> 27) & 1;
-            if (swdec || sec == 0) { c->DataRxDrop++; return; }
-            hdr += 8;
-            if (end < hdr + 8) return;
-            end -= 8;
-        }
-        if (end < hdr + 8) { c->RxFlt[4]++; return; }
-        llc = f + hdr;
-        if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] != 0 || llc[4] != 0) { c->RxFlt[5]++; return; }
-        c->DataRx++;
-        WifiCx_OnRxData(c->Self, f + 4, f + 16, llc + 6, f + hdr + 8, end - hdr - 8);
-    }
-}
-
 /*
  * rtl8188eu - Phase 3b (KMDF USB, ARM64)
  *
@@ -1470,10 +1444,12 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
     if (type == 2 && state == JOIN_UP) {
         ULONG hdr = 24, end = len;
         const UCHAR *llc;
-        if ((fl & 3) != 2) return;                          /* only From-DS */
-        if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) return;
-        if (sub & 0x04) return;                             /* null / no-data subtypes */
-        if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) return;
+        c->RxType2++;
+        if (c->RxType2 == 1) { c->RxFirstFc = f[0] | (f[1] << 8); c->RxFirstV0 = v0; }
+        if ((fl & 3) != 2) { c->RxFlt[0]++; return; }                      /* only From-DS */
+        if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) { c->RxFlt[1]++; return; }
+        if (sub & 0x04) { c->RxFlt[2]++; return; }                         /* null / no-data subtypes */
+        if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) { c->RxFlt[3]++; return; }
         if (sub & 0x08) hdr += 2;                           /* QoS control */
         if ((fl & 0x80) && (sub & 0x08)) hdr += 4;          /* HT control */
         if (fl & 0x40) {                                    /* protected: hw decrypted keeps CCMP hdr + MIC */
@@ -1483,9 +1459,9 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
             if (end < hdr + 8) return;
             end -= 8;
         }
-        if (end < hdr + 8) return;
+        if (end < hdr + 8) { c->RxFlt[4]++; return; }
         llc = f + hdr;
-        if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] != 0 || llc[4] != 0) { c->DataRxDrop++; return; }
+        if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] != 0 || llc[4] != 0) { c->RxFlt[5]++; return; }
         c->DataRx++;
         WifiCx_OnRxData(c->Self, f + 4, f + 16, llc + 6, f + hdr + 8, end - hdr - 8);
     }

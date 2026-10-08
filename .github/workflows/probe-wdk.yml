@@ -34,8 +34,8 @@ jobs:
 
             $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0"
             $files = Get-ChildItem $root -File -ErrorAction SilentlyContinue
-            Emit "files" (($files | ForEach-Object { $_.Name + ' ' + $_.Length }) -join "`n")
-            $names = @('WDI_INDICATION_BSS_ENTRY_LIST_PARAMETERS','WDI_BSS_ENTRY_CONTAINER','WDI_SCAN_PARAMETERS','WDI_SCAN_COMPLETE_PARAMETERS','WDI_INDICATION_SCAN_COMPLETE_PARAMETERS','WDI_BSS_ENTRY_CONTAINER_OPTIONAL_TLVS','WDI_CHANNEL_INFO')
+            Emit "arr" ((Get-Content "$root\arrayofelements.hpp" -Raw) -replace '\s+',' ')
+            $names = @('WDI_BYTE_BLOB','WDI_SIGNAL_INFO_CONTAINER','WDI_CHANNEL_INFO_CONTAINER','WDI_MAC_ADDRESS_CONTAINER','WDI_AGE_INFO_CONTAINER','WDI_MAC_ADDRESS','WDI_SSID','WDI_SCAN_PARAMETERS_CONTAINER')
             foreach ($f in $files) {
               if ($f.Extension -notin '.h','.hpp') { continue }
               $raw = Get-Content $f.FullName -Raw

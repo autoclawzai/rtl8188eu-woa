@@ -22,20 +22,18 @@ jobs:
               }
             }
             $f = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0\TlvGenerated_.hpp"
-            $raw = Get-Content $f -Raw
-            $names = @('WDI_ASSOCIATION_RESULT_PARAMETERS','WDI_INDICATION_ASSOCIATION_RESULT_LIST','WDI_SET_ADD_CIPHER_KEYS_CONTAINER','WDI_CIPHER_KEY_ID_STRUCT','WDI_CIPHER_KEY_TYPE_STRUCT','WDI_DISCONNECT_PARAMETERS','WDI_SET_DEFAULT_KEY_ID_STRUCT','WDI_SET_DELETE_CIPHER_KEYS_CONTAINER','WDI_LINK_STATE_CHANGE_PARAMETERS','WDI_LINK_STATE_CHANGE_CONTAINER','WDI_INDICATION_CONNECT_COMPLETE_PARAMETERS')
-            $out = @()
-            foreach ($n in $names) {
-              $m = [regex]::Match($raw, 'typedef\s+struct\s+_?' + $n + '\b[\s\S]*?\}\s*' + $n + '\b[^;]*;')
-              if ($m.Success) {
-                $t = $m.Value
-                $t = [regex]::Replace($t, '#ifdef __cplusplus[\s\S]*?#else[^\n]*\n[\s\S]*?#endif[^\n]*\n', '')   # array typedef pairs
-                $t = [regex]::Replace($t, '#ifdef __cplusplus[\s\S]*?#endif[^\n]*\n', '')
-                $t = [regex]::Replace($t, '//[^\n]*', '')
-                $out += ('## ' + $n + ': ' + ($t -replace '\s+',' '))
-              } else { $out += ('## ' + $n + ': NOT FOUND') }
-            }
-            $cand = [regex]::Matches($raw,'\}\s*(WDI_[A-Z0-9_]*(CIPHER|KEY|CONNECT_PARAM|ASSOCIATION_RESULT)[A-Z0-9_]*)\b') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
-            $out += ('## CANDIDATES: ' + ($cand -join ' '))
+            $raw = (Get-ChildItem $root -Include *.h,*.hpp -Recurse | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+            $fn = [regex]::Matches($raw,'\b(Generate|Parse|CleanupParsed)Wdi[A-Za-z0-9_]*(Association|LinkState|Connect|Disconnect|Cipher|DefaultKey|Roam)[A-Za-z0-9_]*\s*\([^)]*\)') | ForEach-Object { ($_.Value -replace '\s+',' ') } | Sort-Object -Unique
+            $out = @('## FUNCS: ' + ($fn -join ' ;; '))
+            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_ASSOCIATION_RESULT_CONTAINER\b[\s\S]*?\}\s*WDI_ASSOCIATION_RESULT_CONTAINER\b[^;]*;')
+            $out += ('## ASSOC: ' + ($m.Value -replace '\s+',' '))
+            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_LINK_STATE_CHANGE_PARAMETERS\w*\b[\s\S]*?\}\s*\w+\b[^;]*;')
+            $out += ('## LINK: ' + ($m.Value -replace '\s+',' '))
+            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_TASK_CONNECT_PARAMETERS\b[\s\S]*?\}\s*WDI_TASK_CONNECT_PARAMETERS\b[^;]*;')
+            $out += ('## CONN: ' + ($m.Value -replace '\s+',' '))
+            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_INDICATION_ASSOCIATION_RESULT\w*\b[\s\S]*?\}\s*\w+\b[^;]*;')
+            $out += ('## IND_ASSOC: ' + ($m.Value -replace '\s+',' '))
+            $m = [regex]::Match($raw, 'typedef\s+struct\s+_?WDI_INDICATION_DISCONNECT\w*\b[\s\S]*?\}\s*\w+\b[^;]*;')
+            $out += ('## IND_DISC: ' + ($m.Value -replace '\s+',' '))
             Emit "structs" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

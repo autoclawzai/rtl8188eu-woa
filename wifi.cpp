@@ -39,12 +39,6 @@ inline void* operator new(size_t, void* p) noexcept { return p; }
 inline void  operator delete(void*, void*) noexcept {}
 
 void* __cdecl operator new(size_t size) noexcept { return WifiAlloc(size); }
-void* __cdecl operator new[](size_t size) noexcept { return WifiAlloc(size); }
-void* __cdecl operator new[](size_t size, ULONG_PTR ctx) noexcept
-{
-    if (ctx != 0) return operator new(size, ctx);
-    return WifiAlloc(size);
-}
 
 void* __cdecl operator new(size_t size, ULONG_PTR ctx) noexcept
 {

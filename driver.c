@@ -159,6 +159,7 @@ typedef struct _DEVICE_CONTEXT {
     WDFTIMER        StatsTimer;
     KEVENT          JoinEvent;
     volatile LONG   JoinState;
+    volatile LONG   Stopping;               /* set at D0Exit: work items must not call into WiFiCx any more */
     volatile LONG   JoinJob;
     UCHAR           JoinBssid[6];
     UCHAR           JoinSsid[32];
@@ -1180,6 +1181,7 @@ static ULONG Join_BuildAssocReq(PDEVICE_CONTEXT c, UCHAR *f)
 
 static NTSTATUS Join_Wait(PDEVICE_CONTEXT c, ULONG ms)
 {
+    if (c->Stopping) return STATUS_CANCELLED;
     LARGE_INTEGER t;
     t.QuadPart = -(LONGLONG)ms * 10000LL;
     return KeWaitForSingleObject(&c->JoinEvent, Executive, KernelMode, FALSE, &t);
@@ -1302,8 +1304,9 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
             InterlockedExchange(&c->JoinState, JOIN_IDLE);
             Join_HwDown(c);
         }
-        WifiCx_OnConnectResult(dev, st, c->JoinStatus, c->JoinAid, c->JoinBssid,
-                               c->AssocReq, c->AssocReqLen, c->AssocResp, c->AssocRespLen);
+        if (!c->Stopping)
+            WifiCx_OnConnectResult(dev, st, c->JoinStatus, c->JoinAid, c->JoinBssid,
+                                   c->AssocReq, c->AssocReqLen, c->AssocResp, c->AssocRespLen);
     } else if (job == JOB_LEAVE) {
         UCHAR f[26];
         if (c->JoinState == JOIN_UP && c->HwReady) {
@@ -1313,8 +1316,8 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
         }
         InterlockedExchange(&c->JoinState, JOIN_IDLE);
         if (c->HwReady) Join_HwDown(c);
-        WifiCx_OnDisconnectDone(dev);
-        if (c->HwReady) ScanStart(c);          /* refresh the BSS list */
+        if (!c->Stopping) WifiCx_OnDisconnectDone(dev);
+        if (c->HwReady && !c->Stopping) ScanStart(c);          /* refresh the BSS list */
     }
 }
 
@@ -1345,6 +1348,7 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
 {
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    if (c->Stopping) return;
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }
@@ -1353,6 +1357,7 @@ static VOID EvtLossWork(WDFWORKITEM wi)
 {
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    if (c->Stopping) return;
     if (c->HwReady) Join_HwDown(c);
     WifiCx_OnLinkLost(dev, c->LossReason);
 }
@@ -1735,6 +1740,8 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     RegLog(dev, L"Log_D0Entry_Count", ctx->D0Count);
     RegLog(dev, L"Log_D0Entry_Prev", (ULONG)prev);
     InterlockedExchange(&ctx->HwReady, 0);
+    InterlockedExchange(&ctx->Stopping, 0);
+    InterlockedExchange(&ctx->JoinState, 0);
 
     st = Rtl_PowerOn(ctx);
     RegLog(dev, L"Log_PowerOn_Status", (ULONG)st);
@@ -1796,7 +1803,9 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     PDEVICE_CONTEXT ctx = GetDeviceContext(dev);
     UNREFERENCED_PARAMETER(target);
 
+    InterlockedExchange(&ctx->Stopping, 1);
     InterlockedExchange(&ctx->JoinState, 0);
+    KeSetEvent(&ctx->JoinEvent, 0, FALSE);
     InterlockedExchange(&ctx->ScanCancel, 1);
     InterlockedExchange(&ctx->HwReady, 0);
     WdfTimerStop(ctx->StatsTimer, TRUE);

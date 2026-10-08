@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Continue'
 $out = "$env:USERPROFILE\Desktop\diag10.txt"
 "== 5d diag $(Get-Date) ssid=$Ssid ==" | Out-File $out
 
+# pehle disconnect, taaki driver safely hat sake
+netsh wlan disconnect | Out-Null
+Start-Sleep 6
 Get-WindowsDriver -Online | Where-Object { $_.OriginalFileName -match 'rtl8188eu' } | ForEach-Object {
   pnputil /delete-driver $_.Driver /uninstall /force | Out-Null }
 Import-Certificate -FilePath .\rtl8188eu-test.cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null

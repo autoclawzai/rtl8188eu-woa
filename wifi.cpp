@@ -12,6 +12,7 @@
 #include <wdf.h>
 #include <netadaptercx.h>
 #include <netiodef.h>
+#include <net/virtualaddress.h>
 #include <wificx.h>
 #include "dot11wificxintf.h"
 #include "dot11wificxtypes.hpp"

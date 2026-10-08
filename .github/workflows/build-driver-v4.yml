@@ -39,7 +39,7 @@ jobs:
             $sys = Get-ChildItem -Recurse -Filter rtl8188eu.sys -ErrorAction SilentlyContinue | Select-Object -First 1
           }
           if (-not $sys) {
-            Get-Content errors.log -ErrorAction SilentlyContinue | Select-Object -Unique -First 15 | ForEach-Object { Write-Host "::error title=msbuild::$_" }
+            Get-Content errors.log -ErrorAction SilentlyContinue | ForEach-Object { ($_ -replace '^\s*\d+>','' -replace 'C:\\Program Files \(x86\)\\Windows Kits\\10\\Include\\10.0.26100.0\\','' -replace '\[D:\\a.*$','').Trim() } | Select-Object -Unique -First 40 | ForEach-Object { Write-Host "::error title=msbuild::$_" }
             exit 1
           }
           Write-Host "::notice title=sys::$($sys.FullName) $($sys.Length) bytes"

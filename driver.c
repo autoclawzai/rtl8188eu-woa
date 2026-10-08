@@ -88,6 +88,24 @@
 #define SCAN_PASSIVE_MS     300
 #define SCAN_ACTIVE_MS      75
 #define SCAN_DIRECTED_MS    100
+#define TXQ_N               32
+#define TXQ_BUF             1600
+#define TXD_RATE_DATA       3         /* CCK 11M, fixed until rate control (5e) */
+#define JOIN_IDLE           0
+#define JOIN_AUTH           1
+#define JOIN_ASSOC          2
+#define JOIN_UP             3
+#define JOB_JOIN            1
+#define JOB_LEAVE           2
+#define REG_MSR_            0x0102
+#define REG_BSSID_          0x0618
+#define REG_HMTFR_          0x01CC
+#define REG_HMBOX_0_        0x01D0
+#define REG_BEACON_CTRL_    0x0550
+#define REG_BCN_MAX_ERR_    0x055D
+#define REG_BCN_PSR_RPT_    0x06A8
+#define REG_SLOT_           0x051B
+#define REG_RCR_            0x0608
 enum { SCAN_PASSIVE = 1, SCAN_ACTIVE = 2, SCAN_DIRECTED = 3 };
 
 
@@ -132,6 +150,32 @@ typedef struct _DEVICE_CONTEXT {
     ULONG           ReaderFails;
     ULONG           D0Count, ScanRuns;
     volatile LONG   FastScan;               /* 1 = scan requested by Windows (shorter dwells) */
+    /* phase 5d: join + data path */
+    WDFDEVICE       Self;
+    WDFUSBPIPE      TxPipeData;             /* bulk OUT for BE queue (second out endpoint) */
+    WDFWAITLOCK     TxLock;                 /* serialises TxDataBuf users */
+    WDFSPINLOCK     TxQLock;
+    WDFWORKITEM     JoinWork, LossWork, TxWork;
+    KEVENT          JoinEvent;
+    volatile LONG   JoinState;
+    volatile LONG   JoinJob;
+    UCHAR           JoinBssid[6];
+    UCHAR           JoinSsid[32];
+    UCHAR           JoinSsidLen;
+    UCHAR           JoinCh;
+    UCHAR           JoinExtIe[256];
+    ULONG           JoinExtIeLen;
+    USHORT          JoinAid, JoinStatus, JoinCap, LossReason;
+    UCHAR           AssocReq[420];
+    ULONG           AssocReqLen;
+    UCHAR           AssocResp[420];
+    ULONG           AssocRespLen;
+    ULONG           HMbox;
+    ULONG           TxQHead, TxQTail;
+    USHORT          TxQLen[TXQ_N];
+    UCHAR           TxQ[TXQ_N][TXQ_BUF];
+    UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
+    ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -808,6 +852,8 @@ static VOID LogBssList(WDFDEVICE dev, PDEVICE_CONTEXT c)
 
 /* ---- phase 5a: RX via WDF continuous reader ------------------------------ */
 
+static VOID Rx_Dispatch(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len);
+
 VOID EvtUsbRxComplete(WDFUSBPIPE pipe, WDFMEMORY mem, size_t n, WDFCONTEXT ctx)
 {
     PDEVICE_CONTEXT c = GetDeviceContext((WDFDEVICE)ctx);
@@ -822,6 +868,8 @@ VOID EvtUsbRxComplete(WDFUSBPIPE pipe, WDFMEMORY mem, size_t n, WDFCONTEXT ctx)
     WdfSpinLockAcquire(c->BssLock);
     Scan_ParseBuffer(c, p, (ULONG)n, c->CurCh);
     WdfSpinLockRelease(c->BssLock);
+
+    if (c->JoinState != JOIN_IDLE) Rx_Dispatch(c, p, (ULONG)n);
 }
 
 BOOLEAN EvtUsbReadersFailed(WDFUSBPIPE pipe, NTSTATUS status, USBD_STATUS usbdStatus)
@@ -1020,6 +1068,7 @@ NTSTATUS Rtl_WifiScanRequest(WDFDEVICE dev)
 {
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     if (!c->HwReady) return STATUS_DEVICE_NOT_READY;
+    if (c->JoinState != 0) return STATUS_DEVICE_BUSY;    /* connected/joining: answer from the cached BSS list */
     c->FastScan = 1;
     ScanStart(c);                                /* joins a scan that is already running */
     return STATUS_SUCCESS;
@@ -1034,6 +1083,408 @@ ULONG Rtl_SnapshotBss(WDFDEVICE dev, BSS_ENTRY *out, ULONG max)
     RtlCopyMemory(out, c->Bss, sizeof(BSS_ENTRY) * n);
     WdfSpinLockRelease(c->BssLock);
     return n;
+}
+
+/* ======================================================================
+ * phase 5d: join (open auth + assoc), data TX/RX conversion
+ * ====================================================================== */
+
+static USHORT Le16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
+
+/* Generic TX through the descriptor. mgmt -> ep 0x02 / queue MGNT, data -> second endpoint / queue BE.
+ * Called at PASSIVE_LEVEL only. frame = full 802.11 frame (seq ctrl is patched here). */
+static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN mgmt, BOOLEAN bmc)
+{
+    ULONG w[8];
+    USHORT ck = 0;
+    ULONG seq;
+    UCHAR i;
+    PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
+    WDFUSBPIPE pipe = mgmt ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
+    WDF_MEMORY_DESCRIPTOR md;
+    WDF_REQUEST_SEND_OPTIONS opts;
+    ULONG_PTR written = 0;
+    NTSTATUS st;
+
+    if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
+
+    WdfWaitLockAcquire(c->TxLock, NULL);
+    seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
+    RtlCopyMemory(f, frame, fl);
+    f[22] = (UCHAR)((seq << 4) & 0xFF);
+    f[23] = (UCHAR)((seq << 4) >> 8);
+
+    w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
+    w[1] = mgmt ? 0x00001200u : 0u;
+    w[2] = 0x03010000u;
+    w[3] = seq << 16;
+    w[4] = 0x00000100u;
+    w[5] = mgmt ? 0x001A0000u : (0x0001FF00u | TXD_RATE_DATA);
+    w[6] = 0;
+    w[7] = 0x20000000u;
+    for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
+    w[7] |= ck;
+    RtlCopyMemory(b, w, TXDESC_LEN);
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, TXDESC_LEN + fl);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
+    st = WdfUsbTargetPipeWriteSynchronously(pipe, WDF_NO_HANDLE, &opts, &md, (PULONG)&written);
+    if (NT_SUCCESS(st) && written != TXDESC_LEN + fl) st = STATUS_IO_DEVICE_ERROR;
+    WdfWaitLockRelease(c->TxLock);
+    if (mgmt) { if (NT_SUCCESS(st)) c->TxOk++; else c->TxFail++; }
+    else { if (NT_SUCCESS(st)) c->DataTxOk++; else c->DataTxFail++; }
+    return st;
+}
+
+static VOID Mgmt_Header(PDEVICE_CONTEXT c, UCHAR *f, UCHAR fc0)
+{
+    RtlZeroMemory(f, 24);
+    f[0] = fc0;
+    RtlCopyMemory(f + 4, c->JoinBssid, 6);     /* A1 = DA = AP */
+    RtlCopyMemory(f + 10, c->Mac, 6);          /* A2 = SA = us */
+    RtlCopyMemory(f + 16, c->JoinBssid, 6);    /* A3 = BSSID  */
+}
+
+static NTSTATUS Join_SendAuth(PDEVICE_CONTEXT c)
+{
+    UCHAR f[30];
+    Mgmt_Header(c, f, 0xB0);
+    f[24] = 0; f[25] = 0;      /* open system */
+    f[26] = 1; f[27] = 0;      /* seq 1       */
+    f[28] = 0; f[29] = 0;      /* status      */
+    return Tx_Raw(c, f, sizeof(f), TRUE, FALSE);
+}
+
+/* Builds the association request into c->AssocReq (body only, after the 24-byte header, is what WDI wants). */
+static ULONG Join_BuildAssocReq(PDEVICE_CONTEXT c, UCHAR *f)
+{
+    ULONG n = 24;
+    Mgmt_Header(c, f, 0x00);
+    f[n++] = 0x21; f[n++] = 0x04;                 /* capability: ESS | short preamble | short slot */
+    f[n++] = 10;   f[n++] = 0;                    /* listen interval */
+    f[n++] = 0;    f[n++] = c->JoinSsidLen;       /* SSID */
+    RtlCopyMemory(f + n, c->JoinSsid, c->JoinSsidLen); n += c->JoinSsidLen;
+    f[n++] = 1; f[n++] = 8;                       /* supported rates: 1,2,5.5,11 basic + 6,9,12,18 */
+    f[n++] = 0x82; f[n++] = 0x84; f[n++] = 0x8B; f[n++] = 0x96;
+    f[n++] = 0x0C; f[n++] = 0x12; f[n++] = 0x18; f[n++] = 0x24;
+    f[n++] = 50; f[n++] = 4;                      /* extended rates: 24,36,48,54 */
+    f[n++] = 0x30; f[n++] = 0x48; f[n++] = 0x60; f[n++] = 0x6C;
+    if (c->JoinExtIeLen && n + c->JoinExtIeLen < 400) {   /* RSN / vendor IEs from Windows */
+        RtlCopyMemory(f + n, c->JoinExtIe, c->JoinExtIeLen);
+        n += c->JoinExtIeLen;
+    }
+    return n;
+}
+
+static NTSTATUS Join_Wait(PDEVICE_CONTEXT c, ULONG ms)
+{
+    LARGE_INTEGER t;
+    t.QuadPart = -(LONGLONG)ms * 10000LL;
+    return KeWaitForSingleObject(&c->JoinEvent, Executive, KernelMode, FALSE, &t);
+}
+
+/* H2C media status report (gen2 firmware, 8188e): cmd 0x01, parm = connect | role << 4, macid. */
+static NTSTATUS Rtl_H2cMediaStatus(PDEVICE_CONTEXT c, BOOLEAN connect, UCHAR role, UCHAR macid)
+{
+    ULONG mbox = c->HMbox & 3, retry;
+    UCHAR v = 0;
+    ULONG msg;
+    NTSTATUS st;
+
+    for (retry = 0; retry < 100; retry++) {
+        st = Rtl_Read8(c, REG_HMTFR_, &v);
+        if (!NT_SUCCESS(st)) return st;
+        if (!(v & (1u << mbox))) break;
+    }
+    if (retry == 100) return STATUS_DEVICE_BUSY;
+    msg = 0x01u | ((ULONG)((connect ? 1 : 0) | (role << 4)) << 8) | ((ULONG)macid << 16);
+    st = Rtl_Write32(c, (USHORT)(REG_HMBOX_0_ + mbox * 4), msg);
+    c->HMbox++;
+    return st;
+}
+
+static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
+{
+    NTSTATUS st;
+    UCHAR i;
+    for (i = 0; i < 6; i++) CHK(Rtl_Write8(c, (USHORT)(REG_BSSID_ + i), c->JoinBssid[i]));
+    CHK(Rmw8(c, REG_MSR_, 0x03, 0x02));                         /* link type: station */
+    CHK(Rtl_Write8(c, REG_BCN_MAX_ERR_, 0xFF));
+    CHK(Rtl_Write16(c, REG_BCN_PSR_RPT_, (USHORT)(0xC000 | c->JoinAid)));
+    CHK(Rmw8(c, REG_BEACON_CTRL_, 0x10, 0));                    /* allow TSF update from the AP */
+    CHK(Rtl_Write8(c, REG_SLOT_, (c->JoinCap & 0x0400) ? 9 : 20));
+    CHK(Rmw32(c, REG_RCR_, 0, 0x0000080Eu));                    /* APM | AM | AB | accept data frames */
+    (VOID)Rtl_H2cMediaStatus(c, TRUE, 2 /* AP */, 0);
+    return STATUS_SUCCESS;
+}
+
+static VOID Join_HwDown(PDEVICE_CONTEXT c)
+{
+    (VOID)Rtl_H2cMediaStatus(c, FALSE, 2, 0);
+    (VOID)Rmw8(c, REG_BEACON_CTRL_, 0, 0x10);
+    (VOID)Rmw8(c, REG_MSR_, 0x03, 0x00);
+}
+
+static VOID Join_StopScan(PDEVICE_CONTEXT c)
+{
+    InterlockedExchange(&c->ScanCancel, 1);
+    WdfTimerStop(c->ScanTimer, TRUE);
+    WdfWorkItemFlush(c->ScanWork);
+    WdfTimerStop(c->ScanTimer, TRUE);
+    WdfWorkItemFlush(c->ScanWork);
+    InterlockedExchange(&c->ScanRunning, 0);
+}
+
+static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
+{
+    NTSTATUS st;
+    ULONG tries, n;
+    UCHAR req[440];
+
+    Join_StopScan(c);
+    st = ScanHop(c, c->JoinCh, TRUE);
+    if (!NT_SUCCESS(st)) return st;
+    SleepMs(5);
+
+    /* --- authentication --- */
+    c->JoinStatus = 0xFFFF;
+    for (tries = 0; tries < 4; tries++) {
+        KeClearEvent(&c->JoinEvent);
+        InterlockedExchange(&c->JoinState, JOIN_AUTH);
+        (VOID)Join_SendAuth(c);
+        if (Join_Wait(c, 150) == STATUS_SUCCESS) break;
+    }
+    RegLog(dev, L"Log_Join_AuthTries", tries + 1);
+    if (tries == 4) return STATUS_IO_TIMEOUT;
+    RegLog(dev, L"Log_Join_AuthStatus", c->JoinStatus);
+    if (c->JoinStatus != 0) return STATUS_ACCESS_DENIED;
+
+    /* --- association --- */
+    n = Join_BuildAssocReq(c, req);
+    c->JoinStatus = 0xFFFF;
+    for (tries = 0; tries < 4; tries++) {
+        KeClearEvent(&c->JoinEvent);
+        InterlockedExchange(&c->JoinState, JOIN_ASSOC);
+        (VOID)Tx_Raw(c, req, n, TRUE, FALSE);
+        if (Join_Wait(c, 300) == STATUS_SUCCESS) break;
+    }
+    RegLog(dev, L"Log_Join_AssocTries", tries + 1);
+    if (tries == 4) return STATUS_IO_TIMEOUT;
+    RegLog(dev, L"Log_Join_AssocStatus", c->JoinStatus);
+    if (c->JoinStatus != 0) return STATUS_ACCESS_DENIED;
+
+    c->AssocReqLen = n - 24;
+    RtlCopyMemory(c->AssocReq, req + 24, c->AssocReqLen);
+    RegLog(dev, L"Log_Join_Aid", c->JoinAid);
+
+    st = Join_HwUp(c);
+    RegLog(dev, L"Log_Join_HwUp", (ULONG)st);
+    if (!NT_SUCCESS(st)) return st;
+    InterlockedExchange(&c->JoinState, JOIN_UP);
+    return STATUS_SUCCESS;
+}
+
+static VOID EvtJoinWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    LONG job = c->JoinJob;
+
+    if (job == JOB_JOIN) {
+        NTSTATUS st = c->HwReady ? Join_Run(dev, c) : STATUS_DEVICE_NOT_READY;
+        c->JoinRuns++;
+        RegLog(dev, L"Log_Join_Runs", c->JoinRuns);
+        RegLog(dev, L"Log_Join_Status", (ULONG)st);
+        if (!NT_SUCCESS(st)) {
+            InterlockedExchange(&c->JoinState, JOIN_IDLE);
+            Join_HwDown(c);
+        }
+        WifiCx_OnConnectResult(dev, st, c->JoinStatus, c->JoinAid, c->JoinBssid,
+                               c->AssocReq, c->AssocReqLen, c->AssocResp, c->AssocRespLen);
+    } else if (job == JOB_LEAVE) {
+        UCHAR f[26];
+        if (c->JoinState == JOIN_UP && c->HwReady) {
+            Mgmt_Header(c, f, 0xC0);          /* deauthentication, reason 3 = leaving */
+            f[24] = 3; f[25] = 0;
+            (VOID)Tx_Raw(c, f, sizeof(f), TRUE, FALSE);
+        }
+        InterlockedExchange(&c->JoinState, JOIN_IDLE);
+        if (c->HwReady) Join_HwDown(c);
+        WifiCx_OnDisconnectDone(dev);
+        if (c->HwReady) ScanStart(c);          /* refresh the BSS list */
+    }
+}
+
+static VOID EvtLossWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    if (c->HwReady) Join_HwDown(c);
+    WifiCx_OnLinkLost(dev, c->LossReason);
+}
+
+/* ---- data TX queue (PASSIVE worker drains frames queued at DISPATCH) ---- */
+
+static VOID EvtTxWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+
+    for (;;) {
+        ULONG idx, len;
+        BOOLEAN have;
+        WdfSpinLockAcquire(c->TxQLock);
+        have = (c->TxQHead != c->TxQTail);
+        idx = c->TxQTail % TXQ_N;
+        len = c->TxQLen[idx];
+        WdfSpinLockRelease(c->TxQLock);
+        if (!have) break;
+        if (c->JoinState == JOIN_UP && c->HwReady)
+            (VOID)Tx_Raw(c, c->TxQ[idx], len, FALSE, (BOOLEAN)(c->TxQ[idx][16] & 1));
+        WdfSpinLockAcquire(c->TxQLock);
+        c->TxQTail++;
+        WdfSpinLockRelease(c->TxQLock);
+    }
+}
+
+/* ---- RX: management responses + data -> Ethernet ---- */
+
+static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
+{
+    UCHAR type, sub, fl;
+    LONG state = c->JoinState;
+    if (len < 24) return;
+    type = (UCHAR)((f[0] >> 2) & 3);
+    sub  = (UCHAR)(f[0] >> 4);
+    fl   = f[1];
+
+    if (type == 0) {
+        if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) return;
+        if (sub == 11 && state == JOIN_AUTH && len >= 30) {
+            if (Le16(f + 26) != 2) return;
+            c->JoinStatus = Le16(f + 28);
+            KeSetEvent(&c->JoinEvent, 0, FALSE);
+        } else if (sub == 1 && state == JOIN_ASSOC && len >= 30) {
+            ULONG bl = len - 24;
+            if (bl > sizeof(c->AssocResp)) bl = sizeof(c->AssocResp);
+            c->JoinCap = Le16(f + 24);
+            c->JoinStatus = Le16(f + 26);
+            c->JoinAid = (USHORT)(Le16(f + 28) & 0x3FFF);
+            RtlCopyMemory(c->AssocResp, f + 24, bl);
+            c->AssocRespLen = bl;
+            KeSetEvent(&c->JoinEvent, 0, FALSE);
+        } else if ((sub == 12 || sub == 10) && state == JOIN_UP && len >= 26) {
+            c->LossReason = Le16(f + 24);
+            if (InterlockedCompareExchange(&c->JoinState, JOIN_IDLE, JOIN_UP) == JOIN_UP)
+                WdfWorkItemEnqueue(c->LossWork);
+        }
+        return;
+    }
+
+    if (type == 2 && state == JOIN_UP) {
+        ULONG hdr = 24, end = len;
+        const UCHAR *llc;
+        if ((fl & 3) != 2) return;                          /* only From-DS */
+        if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) return;
+        if (sub & 0x04) return;                             /* null / no-data subtypes */
+        if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) return;
+        if (sub & 0x08) hdr += 2;                           /* QoS control */
+        if ((fl & 0x80) && (sub & 0x08)) hdr += 4;          /* HT control */
+        if (fl & 0x40) {                                    /* protected: hw decrypted keeps CCMP hdr + MIC */
+            ULONG sec = (v0 >> 20) & 7, swdec = (v0 >> 27) & 1;
+            if (swdec || sec == 0) { c->DataRxDrop++; return; }
+            hdr += 8;
+            if (end < hdr + 8) return;
+            end -= 8;
+        }
+        if (end < hdr + 8) return;
+        llc = f + hdr;
+        if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] != 0 || llc[4] != 0) { c->DataRxDrop++; return; }
+        c->DataRx++;
+        WifiCx_OnRxData(c->Self, f + 4, f + 16, llc + 6, f + hdr + 8, end - hdr - 8);
+    }
+}
+
+static VOID Rx_Dispatch(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len)
+{
+    ULONG off = 0;
+    while (off + RX_DESC_LEN <= len) {
+        ULONG v0 = *(const ULONG *)(buf + off);
+        ULONG v3 = *(const ULONG *)(buf + off + 12);
+        ULONG pktLen = v0 & 0x3FFF;
+        ULONG drvInfo = ((v0 >> 16) & 0xF) * 8;
+        ULONG shift = (v0 >> 24) & 3;
+        ULONG hdr = RX_DESC_LEN + drvInfo + shift;
+        if (pktLen == 0 || off + hdr + pktLen > len) break;
+        if (!(v0 & 0xC000) && ((v3 >> 14) & 3) == 0)        /* no CRC/ICV error, not a C2H report */
+            Rx_Frame(c, buf + off + hdr, pktLen, v0);
+        off += (hdr + pktLen + 127) & ~127u;
+    }
+}
+
+/* ---- exported to wifi.cpp ---- */
+
+NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, ULONG ssidLen, UCHAR ch,
+                         const UCHAR *extIe, ULONG extIeLen)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    if (!c->HwReady) return STATUS_DEVICE_NOT_READY;
+    if (ssidLen > 32 || ch < 1 || ch > 14 || extIeLen > sizeof(c->JoinExtIe)) return STATUS_INVALID_PARAMETER;
+    if (c->JoinState != JOIN_IDLE) return STATUS_DEVICE_BUSY;
+    RtlCopyMemory(c->JoinBssid, bssid, 6);
+    RtlZeroMemory(c->JoinSsid, sizeof(c->JoinSsid));
+    RtlCopyMemory(c->JoinSsid, ssid, ssidLen);
+    c->JoinSsidLen = (UCHAR)ssidLen;
+    c->JoinCh = ch;
+    c->JoinExtIeLen = extIeLen;
+    if (extIeLen) RtlCopyMemory(c->JoinExtIe, extIe, extIeLen);
+    c->AssocReqLen = c->AssocRespLen = 0;
+    c->JoinAid = 0;
+    c->TxQHead = c->TxQTail = 0;
+    c->JoinJob = JOB_JOIN;
+    WdfWorkItemEnqueue(c->JoinWork);
+    return STATUS_SUCCESS;
+}
+
+VOID Rtl_WifiDisconnect(WDFDEVICE dev)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    c->JoinJob = JOB_LEAVE;
+    WdfWorkItemEnqueue(c->JoinWork);
+}
+
+NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    ULONG idx, fl;
+    UCHAR *f;
+    if (c->JoinState != JOIN_UP) return STATUS_DEVICE_NOT_READY;
+    if (len < 14 || len > 1514) return STATUS_INVALID_PARAMETER;
+
+    WdfSpinLockAcquire(c->TxQLock);
+    if (c->TxQHead - c->TxQTail >= TXQ_N) {
+        c->DataTxDrop++;
+        WdfSpinLockRelease(c->TxQLock);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    idx = c->TxQHead % TXQ_N;
+    f = c->TxQ[idx];
+    RtlZeroMemory(f, 24);
+    f[0] = 0x08; f[1] = 0x01;                      /* data, To-DS */
+    RtlCopyMemory(f + 4, c->JoinBssid, 6);         /* A1 = BSSID */
+    RtlCopyMemory(f + 10, c->Mac, 6);              /* A2 = SA   */
+    RtlCopyMemory(f + 16, eth, 6);                 /* A3 = DA   */
+    f[24] = 0xAA; f[25] = 0xAA; f[26] = 0x03; f[27] = 0; f[28] = 0; f[29] = 0;
+    f[30] = eth[12]; f[31] = eth[13];              /* ethertype */
+    RtlCopyMemory(f + 32, eth + 14, len - 14);
+    fl = 32 + len - 14;
+    /* TxQ[idx][16] is A3[0]: used by the worker for the multicast bit */
+    c->TxQLen[idx] = (USHORT)fl;
+    c->TxQHead++;
+    WdfSpinLockRelease(c->TxQLock);
+    WdfWorkItemEnqueue(c->TxWork);
+    return STATUS_SUCCESS;
 }
 
 /* ---- driver ------------------------------------------------------------ */
@@ -1090,7 +1541,40 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     wcfg.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ParentObject = dev;
-    return WdfWorkItemCreate(&wcfg, &attr, &c->ScanWork);
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->ScanWork);
+    if (!NT_SUCCESS(st)) return st;
+
+    /* phase 5d */
+    c->Self = dev;
+    KeInitializeEvent(&c->JoinEvent, NotificationEvent, FALSE);
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWaitLockCreate(&attr, &c->TxLock);
+    if (!NT_SUCCESS(st)) return st;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfSpinLockCreate(&attr, &c->TxQLock);
+    if (!NT_SUCCESS(st)) return st;
+
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtJoinWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->JoinWork);
+    if (!NT_SUCCESS(st)) return st;
+
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtLossWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->LossWork);
+    if (!NT_SUCCESS(st)) return st;
+
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtTxWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    return WdfWorkItemCreate(&wcfg, &attr, &c->TxWork);
 }
 
 /* PrepareHardware: USB plumbing + EFUSE only. Fast, no radio bring-up. */
@@ -1127,7 +1611,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     npipes = WdfUsbInterfaceGetNumConfiguredPipes(ctx->UsbInterface);
     RegLog(dev, L"Log_NumPipes", npipes);
 
-    ctx->BulkIn = NULL; ctx->TxPipe = NULL; ctx->BulkOutCount = 0;
+    ctx->BulkIn = NULL; ctx->TxPipe = NULL; ctx->TxPipeData = NULL; ctx->BulkOutCount = 0;
     for (i = 0; i < npipes; i++) {
         WDF_USB_PIPE_INFORMATION pi;
         WDFUSBPIPE pipe;
@@ -1145,11 +1629,13 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
         } else if (WdfUsbTargetPipeIsOutEndpoint(pipe) && ctx->BulkOutCount < MAX_BULK_OUT) {
             ctx->BulkOut[ctx->BulkOutCount++] = pipe;
             if (pi.EndpointAddress == TX_ENDPOINT) ctx->TxPipe = pipe;
+            else if (ctx->TxPipeData == NULL) ctx->TxPipeData = pipe;
         }
     }
     RegLog(dev, L"Log_BulkIn", ctx->BulkIn ? 1 : 0);
     RegLog(dev, L"Log_BulkOutCount", ctx->BulkOutCount);
     RegLog(dev, L"Log_TxPipe", ctx->TxPipe ? 1 : 0);
+    RegLog(dev, L"Log_TxPipeData", ctx->TxPipeData ? 1 : 0);
     if (!ctx->BulkIn) return STATUS_DEVICE_CONFIGURATION_ERROR;
     RegLog(dev, L"Log_Stage", 4);   /* pipes enumerated */
 
@@ -1264,8 +1750,12 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     PDEVICE_CONTEXT ctx = GetDeviceContext(dev);
     UNREFERENCED_PARAMETER(target);
 
+    InterlockedExchange(&ctx->JoinState, 0);
     InterlockedExchange(&ctx->ScanCancel, 1);
     InterlockedExchange(&ctx->HwReady, 0);
+    WdfWorkItemFlush(ctx->JoinWork);
+    WdfWorkItemFlush(ctx->LossWork);
+    WdfWorkItemFlush(ctx->TxWork);
     /* stop+flush twice: a work item that was already running may re-arm the timer once */
     WdfTimerStop(ctx->ScanTimer, TRUE);
     WdfWorkItemFlush(ctx->ScanWork);

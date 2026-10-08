@@ -71,7 +71,31 @@ typedef struct _WIFI_CTX {
     LONG        LastMsgId;
     volatile LONG ScanPending;      /* a WDI scan task waits for its M4 */
     WDI_MESSAGE_HEADER ScanHdr;     /* header of that task */
+    /* phase 5d */
+    volatile LONG ConnPending;      /* a WDI connect task waits for its M4 */
+    WDI_MESSAGE_HEADER ConnHdr;
+    volatile LONG DiscPending;
+    WDI_MESSAGE_HEADER DiscHdr;
+    UCHAR       Bssid[6];
+    BOOLEAN     Connected;
+    UCHAR       ConnChannel;
+    /* RX ring: Ethernet frames waiting for the NetAdapter rx queue (producer = USB completion, DISPATCH) */
+    KSPIN_LOCK  RxLock;
+    NETPACKETQUEUE RxQueue;
+    volatile LONG RxNotifyArmed;
+    ULONG       RxHead, RxTail;
+    USHORT      RxLen[64];
+    UCHAR       Rx[64][1536];
+    ULONG       RxDropped;
 } WIFI_CTX, *PWIFI_CTX;
+
+typedef struct _QUEUE_CTX {
+    PWIFI_CTX    Wifi;
+    NET_EXTENSION VaExt;
+} QUEUE_CTX, *PQUEUE_CTX;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
+
+static WDFDEVICE g_WifiDevice;     /* one adapter per driver instance */
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WIFI_CTX, GetWifiCtx)
 
@@ -191,12 +215,73 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         return;
     }
 
+    case WDI_TASK_CONNECT: {
+        WDI_TASK_CONNECT_PARAMETERS p = {};
+        NTSTATUS st = Ndis2Nt(ParseWdiTaskConnectToIhv(inLen - sizeof(WDI_MESSAGE_HEADER),
+                                buf + sizeof(WDI_MESSAGE_HEADER), &ctx->Tlv, &p));
+        if (!NT_SUCCESS(st)) {
+            CleanupParsedWdiTaskConnectToIhv(&p);
+            WifiRequestComplete(Request, st, sizeof(WDI_MESSAGE_HEADER));
+            return;
+        }
+        if (p.PreferredBSSEntryList.ElementCount == 0 ||
+            InterlockedCompareExchange(&ctx->ConnPending, 1, 0) != 0) {
+            CleanupParsedWdiTaskConnectToIhv(&p);
+            WifiRequestComplete(Request, STATUS_INVALID_DEVICE_STATE, sizeof(WDI_MESSAGE_HEADER));
+            return;
+        }
+
+        const WDI_CONNECT_BSS_ENTRY_CONTAINER& e = p.PreferredBSSEntryList.pElements[0];
+        UCHAR bssid[6], ssid[32], ssidLen = 0, ch = (UCHAR)e.ChannelInfo.ChannelNumber;
+        RtlCopyMemory(bssid, e.BSSID.Address, 6);
+
+        /* SSID + channel come from the beacon / probe response body (IEs start after ts+interval+cap = 12 bytes) */
+        const UINT8* body = nullptr; ULONG bl = 0;
+        if (e.Optional.ProbeResponseFrame_IsPresent) { body = e.ProbeResponseFrame.pElements; bl = e.ProbeResponseFrame.ElementCount; }
+        else if (e.Optional.BeaconFrame_IsPresent)   { body = e.BeaconFrame.pElements;        bl = e.BeaconFrame.ElementCount; }
+        for (ULONG o = 12; body && o + 2 <= bl; ) {
+            UCHAR id = body[o], l = body[o + 1];
+            if (o + 2 + l > bl) break;
+            if (id == 0 && l <= 32) { RtlCopyMemory(ssid, body + o + 2, l); ssidLen = l; }
+            else if (id == 3 && l >= 1 && ch == 0) ch = body[o + 2];
+            o += 2 + l;
+        }
+
+        UCHAR ext[256]; ULONG extLen = 0;
+        if (p.ConnectParameters.Optional.AssociationRequestVendorIE_IsPresent) {
+            extLen = p.ConnectParameters.AssociationRequestVendorIE.ElementCount;
+            if (extLen > sizeof(ext)) extLen = 0;
+            else if (extLen) RtlCopyMemory(ext, p.ConnectParameters.AssociationRequestVendorIE.pElements, extLen);
+        }
+        ULONG auth = p.ConnectParameters.AuthenticationAlgorithms.ElementCount
+                   ? (ULONG)p.ConnectParameters.AuthenticationAlgorithms.pElements[0] : 0;
+        WLog(Device, L"Log_Wifi_ConnAuth", auth);
+        WLog(Device, L"Log_Wifi_ConnCh", ch);
+        WLog(Device, L"Log_Wifi_ConnSsidLen", ssidLen);
+        CleanupParsedWdiTaskConnectToIhv(&p);
+
+        ctx->ConnHdr = hdr;
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));      /* M3 */
+        st = Rtl_WifiConnect(Device, bssid, ssid, ssidLen, ch, ext, extLen);
+        WLog(Device, L"Log_Wifi_ConnStart", (ULONG)st);
+        if (!NT_SUCCESS(st)) {
+            InterlockedExchange(&ctx->ConnPending, 0);
+            SendM4(Device, WDI_INDICATION_CONNECT_COMPLETE, hdr, st);
+        } else {
+            RtlCopyMemory(ctx->Bssid, bssid, 6);
+            ctx->ConnChannel = ch;
+        }
+        return;
+    }
+
     case WDI_TASK_DISCONNECT:
-        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
-        SendM4(Device, WDI_INDICATION_DISCONNECT_COMPLETE, hdr, STATUS_SUCCESS);
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));      /* M3 */
+        ctx->DiscHdr = hdr;
+        InterlockedExchange(&ctx->DiscPending, 1);
+        Rtl_WifiDisconnect(Device);                       /* M4 comes from WifiCx_OnDisconnectDone */
         return;
 
-    default:   /* includes WDI_TASK_CONNECT (phase 5d) */
+    default:
         WifiRequestComplete(Request, STATUS_NOT_SUPPORTED, sizeof(WDI_MESSAGE_HEADER));
         return;
     }
@@ -252,46 +337,275 @@ extern "C" VOID WifiCx_OnScanComplete(WDFDEVICE Device)
 }
 
 /* ------------------------------------------------------------------ */
-/* data path stubs (5e makes these real)                               */
+/* connect results / link events                                       */
 /* ------------------------------------------------------------------ */
-static VOID DropAll(NETPACKETQUEUE q, BOOLEAN tx)
+extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT StatusCode, USHORT Aid,
+                                       const UCHAR* Bssid, const UCHAR* AssocReq, ULONG AssocReqLen,
+                                       const UCHAR* AssocResp, ULONG AssocRespLen)
 {
-    NET_RING_COLLECTION const* rings = tx ? NetTxQueueGetRingCollection(q) : NetRxQueueGetRingCollection(q);
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    UNREFERENCED_PARAMETER(Aid);
+    if (InterlockedCompareExchange(&ctx->ConnPending, 0, 1) != 1) return;
 
+    if (NT_SUCCESS(Status)) {
+        /* 1) association result */
+        WDI_INDICATION_ASSOCIATION_RESULT_LIST list;
+        list.AssociationResults.AllocateElements(1, 0);
+        if (list.AssociationResults.ElementCount == 1) {
+            WDI_ASSOCIATION_RESULT_CONTAINER& r = list.AssociationResults.pElements[0];
+            RtlCopyMemory(r.BSSID.Address, Bssid, 6);
+            r.AssociationResultParameters.AssociationStatus = (WDI_ASSOC_STATUS)0;      /* success */
+            r.AssociationResultParameters.StatusCode = 0;
+            r.AssociationResultParameters.ReAssociation = FALSE;
+            r.AssociationResultParameters.AuthAlgorithm = (WDI_AUTH_ALGORITHM)1;        /* 802.11 open */
+            r.AssociationResultParameters.UnicastCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+            r.AssociationResultParameters.MulticastDataCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+            r.AssociationResultParameters.MulticastMgmtCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+            r.AssociationResultParameters.PortAuthorized = TRUE;
+            r.AssociationResultParameters.BandID = WDI_BAND_ID_2400;
+            if (AssocReqLen) {
+                r.Optional.AssociationRequestFrame_IsPresent = 1;
+                r.AssociationRequestFrame.SimpleAssign(const_cast<UINT8*>(AssocReq), AssocReqLen);
+            }
+            if (AssocRespLen) {
+                r.Optional.AssociationResponseFrame_IsPresent = 1;
+                r.AssociationResponseFrame.SimpleAssign(const_cast<UINT8*>(AssocResp), AssocRespLen);
+            }
+            UINT8* out = nullptr; ULONG cb = 0;
+            NDIS_STATUS g = GenerateWdiIndicationAssociationResultFromIhv(&list, 0, &ctx->Tlv, &cb, &out);
+            WLog(Device, L"Log_Wifi_AssocResultGen", (ULONG)g);
+            if (g == 0) {
+                SendIndication(Device, ctx->ConnHdr, WDI_INDICATION_ASSOCIATION_RESULT, 0, STATUS_SUCCESS, out, cb);
+                FreeGenerated(out);
+            }
+        }
+
+        /* 2) link state change */
+        WDI_INDICATION_LINK_STATE_CHANGE_PARAMETERS ls = {};
+        WDI_LINK_INFO_CONTAINER li = {};
+        RtlCopyMemory(&ls.LinkStateChangeParameters.PeerMACAddress, Bssid, 6);
+        ls.LinkStateChangeParameters.TxLinkSpeed = 11000;
+        ls.LinkStateChangeParameters.RxLinkSpeed = 11000;
+        ls.LinkStateChangeParameters.LinkQuality = 60;
+        li.LinkID = 0;
+        RtlCopyMemory(&li.LocalLinkMACAddress, ctx->Mac, 6);
+        RtlCopyMemory(&li.PeerLinkMACAddress, Bssid, 6);
+        li.ChannelNumber = ctx->ConnChannel;
+        li.BandId = WDI_BAND_ID_2400;
+        li.RSSI = -50;
+        li.Bandwidth = 20;
+        ls.LinkInfo.SimpleAssign(&li, 1);
+        UINT8* out2 = nullptr; ULONG cb2 = 0;
+        NDIS_STATUS g2 = GenerateWdiIndicationLinkStateChangeFromIhv(&ls, 0, &ctx->Tlv, &cb2, &out2);
+        WLog(Device, L"Log_Wifi_LinkStateGen", (ULONG)g2);
+        if (g2 == 0) {
+            SendIndication(Device, ctx->ConnHdr, WDI_INDICATION_LINK_STATE_CHANGE, 0, STATUS_SUCCESS, out2, cb2);
+            FreeGenerated(out2);
+        }
+        ctx->Connected = TRUE;
+    } else {
+        UNREFERENCED_PARAMETER(StatusCode);
+    }
+    SendM4(Device, WDI_INDICATION_CONNECT_COMPLETE, ctx->ConnHdr, Status);   /* M4 */
+    WLog(Device, L"Log_Wifi_ConnDone", (ULONG)Status);
+}
+
+extern "C" VOID WifiCx_OnDisconnectDone(WDFDEVICE Device)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    ctx->Connected = FALSE;
+    if (InterlockedCompareExchange(&ctx->DiscPending, 0, 1) == 1)
+        SendM4(Device, WDI_INDICATION_DISCONNECT_COMPLETE, ctx->DiscHdr, STATUS_SUCCESS);
+}
+
+extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    ctx->Connected = FALSE;
+    WLog(Device, L"Log_Wifi_LinkLost", Reason);
+    /* TODO(5d): unsolicited WDI disconnect indication so Windows leaves the connected state */
+}
+
+/* ------------------------------------------------------------------ */
+/* data path: TX (Ethernet -> driver.c queue), RX (ring -> NetRing)    */
+/* ------------------------------------------------------------------ */
+static VOID EvtTxAdvance(NETPACKETQUEUE q)
+{
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    NET_RING_COLLECTION const* rings = NetTxQueueGetRingCollection(q);
+    NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
+
+    while (NetPacketIteratorHasAny(&pi)) {
+        NET_PACKET* pkt = NetPacketIteratorGetPacket(&pi);
+        if (!pkt->Ignore) {
+            UCHAR tmp[1536];
+            ULONG n = 0;
+            BOOLEAN ok = TRUE;
+            NET_RING_FRAGMENT_ITERATOR fi = NetPacketIteratorGetFragments(&pi);
+            while (NetFragmentIteratorHasAny(&fi)) {
+                NET_FRAGMENT* fr = NetFragmentIteratorGetFragment(&fi);
+                NET_FRAGMENT_VIRTUAL_ADDRESS const* va =
+                    NetExtensionGetFragmentVirtualAddress(&qc->VaExt, NetFragmentIteratorGetIndex(&fi));
+                ULONG l = (ULONG)fr->ValidLength;
+                if (n + l > sizeof(tmp)) { ok = FALSE; break; }
+                RtlCopyMemory(tmp + n, (PUCHAR)va->VirtualAddress + fr->Offset, l);
+                n += l;
+                NetFragmentIteratorAdvance(&fi);
+            }
+            if (ok && n >= 14) (VOID)Rtl_TxEthernet(g_WifiDevice, tmp, n);
+        }
+        NetPacketIteratorAdvance(&pi);
+    }
+    NetPacketIteratorSet(&pi);
+
+    NET_RING_FRAGMENT_ITERATOR fi2 = NetRingGetAllFragments(rings);
+    NetFragmentIteratorAdvanceToTheEnd(&fi2);
+    NetFragmentIteratorSet(&fi2);
+}
+static VOID EvtTxNotify(NETPACKETQUEUE, BOOLEAN) {}
+static VOID EvtTxCancel(NETPACKETQUEUE q)
+{
+    NET_RING_COLLECTION const* rings = NetTxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
     while (NetPacketIteratorHasAny(&pi)) {
         NetPacketIteratorGetPacket(&pi)->Ignore = 1;
         NetPacketIteratorAdvance(&pi);
     }
     NetPacketIteratorSet(&pi);
-
     NET_RING_FRAGMENT_ITERATOR fi = NetRingGetAllFragments(rings);
     NetFragmentIteratorAdvanceToTheEnd(&fi);
     NetFragmentIteratorSet(&fi);
 }
 
-static VOID EvtTxAdvance(NETPACKETQUEUE q)  { DropAll(q, TRUE); }
-static VOID EvtTxNotify(NETPACKETQUEUE, BOOLEAN) {}
-static VOID EvtTxCancel(NETPACKETQUEUE q)   { DropAll(q, TRUE); }
+static VOID EvtRxAdvance(NETPACKETQUEUE q)
+{
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    PWIFI_CTX w = qc->Wifi;
+    NET_RING_COLLECTION const* rings = NetRxQueueGetRingCollection(q);
 
-static VOID EvtRxAdvance(NETPACKETQUEUE) {}
-static VOID EvtRxNotify(NETPACKETQUEUE, BOOLEAN) {}
-static VOID EvtRxCancel(NETPACKETQUEUE q)   { DropAll(q, FALSE); }
+    /* hand all buffers the OS posted to us */
+    NET_RING_FRAGMENT_ITERATOR post = NetRingGetPostFragments(rings);
+    NetFragmentIteratorAdvanceToTheEnd(&post);
+    NetFragmentIteratorSet(&post);
+
+    NET_RING_FRAGMENT_ITERATOR fi = NetRingGetDrainFragments(rings);
+    NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
+    KIRQL irql;
+
+    for (;;) {
+        if (!NetFragmentIteratorHasAny(&fi)) break;
+        KeAcquireSpinLock(&w->RxLock, &irql);
+        if (w->RxHead == w->RxTail) { KeReleaseSpinLock(&w->RxLock, irql); break; }
+        ULONG idx = w->RxTail % 64;
+        NET_FRAGMENT* fr = NetFragmentIteratorGetFragment(&fi);
+        ULONG len = w->RxLen[idx];
+        if (len <= fr->Capacity) {
+            NET_FRAGMENT_VIRTUAL_ADDRESS const* va =
+                NetExtensionGetFragmentVirtualAddress(&qc->VaExt, NetFragmentIteratorGetIndex(&fi));
+            RtlCopyMemory((PUCHAR)va->VirtualAddress, w->Rx[idx], len);
+            fr->ValidLength = len;
+            fr->Offset = 0;
+            NET_PACKET* pkt = NetPacketIteratorGetPacket(&pi);
+            pkt->FragmentIndex = NetFragmentIteratorGetIndex(&fi);
+            pkt->FragmentCount = 1;
+            pkt->Layout = {};
+            pkt->Layout.Layer2Type = NetPacketLayer2TypeEthernet;
+            NetFragmentIteratorAdvance(&fi);
+            NetPacketIteratorAdvance(&pi);
+        } else {
+            w->RxDropped++;
+        }
+        w->RxTail++;
+        KeReleaseSpinLock(&w->RxLock, irql);
+    }
+    NetFragmentIteratorSet(&fi);
+    NetPacketIteratorSet(&pi);
+}
+
+static VOID EvtRxNotify(NETPACKETQUEUE q, BOOLEAN enabled)
+{
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    InterlockedExchange(&qc->Wifi->RxNotifyArmed, enabled ? 1 : 0);
+}
+
+static VOID EvtRxCancel(NETPACKETQUEUE q)
+{
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    NET_RING_COLLECTION const* rings = NetRxQueueGetRingCollection(q);
+    NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
+    while (NetPacketIteratorHasAny(&pi)) {
+        NetPacketIteratorGetPacket(&pi)->Ignore = 1;
+        NetPacketIteratorAdvance(&pi);
+    }
+    NetPacketIteratorSet(&pi);
+    NET_RING_FRAGMENT_ITERATOR fi = NetRingGetAllFragments(rings);
+    NetFragmentIteratorAdvanceToTheEnd(&fi);
+    NetFragmentIteratorSet(&fi);
+    qc->Wifi->RxQueue = nullptr;
+}
 
 static NTSTATUS EvtCreateTxQueue(NETADAPTER, NETTXQUEUE_INIT* Init)
 {
     NET_PACKET_QUEUE_CONFIG cfg;
     NETPACKETQUEUE q;
+    WDF_OBJECT_ATTRIBUTES attr;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, QUEUE_CTX);
     NET_PACKET_QUEUE_CONFIG_INIT(&cfg, EvtTxAdvance, EvtTxNotify, EvtTxCancel);
-    return NetTxQueueCreate(Init, WDF_NO_OBJECT_ATTRIBUTES, &cfg, &q);
+    NTSTATUS st = NetTxQueueCreate(Init, &attr, &cfg, &q);
+    if (!NT_SUCCESS(st)) return st;
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    qc->Wifi = GetWifiCtx(g_WifiDevice);
+    NET_EXTENSION_QUERY query;
+    NET_EXTENSION_QUERY_INIT(&query, NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_NAME,
+                             NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1, NetExtensionTypeFragment);
+    NetTxQueueGetExtension(q, &query, &qc->VaExt);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS EvtCreateRxQueue(NETADAPTER, NETRXQUEUE_INIT* Init)
 {
     NET_PACKET_QUEUE_CONFIG cfg;
     NETPACKETQUEUE q;
+    WDF_OBJECT_ATTRIBUTES attr;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, QUEUE_CTX);
     NET_PACKET_QUEUE_CONFIG_INIT(&cfg, EvtRxAdvance, EvtRxNotify, EvtRxCancel);
-    return NetRxQueueCreate(Init, WDF_NO_OBJECT_ATTRIBUTES, &cfg, &q);
+    NTSTATUS st = NetRxQueueCreate(Init, &attr, &cfg, &q);
+    if (!NT_SUCCESS(st)) return st;
+    PQUEUE_CTX qc = GetQueueCtx(q);
+    qc->Wifi = GetWifiCtx(g_WifiDevice);
+    NET_EXTENSION_QUERY query;
+    NET_EXTENSION_QUERY_INIT(&query, NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_NAME,
+                             NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1, NetExtensionTypeFragment);
+    NetRxQueueGetExtension(q, &query, &qc->VaExt);
+    qc->Wifi->RxQueue = q;
+    return STATUS_SUCCESS;
+}
+
+/* called by driver.c at DISPATCH_LEVEL for every received data frame */
+extern "C" VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR* Da, const UCHAR* Sa, const UCHAR* EtherType,
+                                const UCHAR* Payload, ULONG PayloadLen)
+{
+    PWIFI_CTX w = GetWifiCtx(Device);
+    KIRQL irql;
+    NETPACKETQUEUE q = nullptr;
+
+    if (PayloadLen + 14 > sizeof(w->Rx[0])) return;
+    KeAcquireSpinLock(&w->RxLock, &irql);
+    if (w->RxHead - w->RxTail < 64) {
+        ULONG idx = w->RxHead % 64;
+        UCHAR* d = w->Rx[idx];
+        RtlCopyMemory(d, Da, 6);
+        RtlCopyMemory(d + 6, Sa, 6);
+        d[12] = EtherType[0]; d[13] = EtherType[1];
+        RtlCopyMemory(d + 14, Payload, PayloadLen);
+        w->RxLen[idx] = (USHORT)(14 + PayloadLen);
+        w->RxHead++;
+        if (InterlockedExchange(&w->RxNotifyArmed, 0)) q = w->RxQueue;
+    } else {
+        w->RxDropped++;
+    }
+    KeReleaseSpinLock(&w->RxLock, irql);
+    if (q) NetRxQueueNotifyMoreReceivedPacketsAvailable(q);
 }
 
 /* ------------------------------------------------------------------ */
@@ -386,6 +700,8 @@ extern "C" NTSTATUS WifiCx_DeviceInitialize(WDFDEVICE Device)
     st = WdfObjectAllocateContext(Device, &attr, (PVOID*)&ctx);
     if (!NT_SUCCESS(st)) return st;
     ctx->Device = Device;
+    g_WifiDevice = Device;
+    KeInitializeSpinLock(&ctx->RxLock);
 
     WIFI_DEVICE_CONFIG cfg;
     WIFI_DEVICE_CONFIG_INIT(&cfg, WDI_VERSION_LATEST, EvtWifiDeviceSendCommand,

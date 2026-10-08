@@ -32,12 +32,14 @@ jobs:
               return ($parts -join "`n")
             }
 
-            $nac = Get-ChildItem "$inc\netadaptercx" -Recurse -Directory | ForEach-Object { $_.FullName.Replace($inc,'') }
-            Emit "nacdirs" ($nac -join "`n")
-            $f = Get-ChildItem "$inc\netadaptercx\2.0" -Recurse -File -Include *.h | ForEach-Object { $_.FullName }
-            Emit "nacfiles" (($f | ForEach-Object { $_.Replace($inc,'') }) -join "`n")
+            $dirs = Get-ChildItem $inc -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }
+            Emit "kmdirs" ($dirs -join ' ')
+            $nd = Get-ChildItem $inc -Directory -Filter '*net*' -ErrorAction SilentlyContinue
+            $f = @()
+            foreach ($d in $nd) { $f += Get-ChildItem $d.FullName -Recurse -File -Filter *.h -ErrorAction SilentlyContinue }
+            Emit "nacfiles" (($f | ForEach-Object { $_.FullName.Replace($inc,'') }) -join "`n")
             $pat = '\b(NET_ADAPTER_TX_CAPABILITIES_INIT\w*|NET_ADAPTER_RX_CAPABILITIES_INIT\w*|NET_PACKET_QUEUE_CONFIG_INIT|NET_ADAPTER_LINK_STATE_INIT|NET_ADAPTER_LINK_LAYER_CAPABILITIES_INIT|NET_ADAPTER_DATAPATH_CALLBACKS_INIT|NetAdapterSetDataPathCapabilities|NetAdapterSetLinkState|NetAdapterSetPermanentLinkLayerAddress|NetAdapterSetCurrentLinkLayerAddress|NetAdapterSetLinkLayerMtuSize|NetTxQueueCreate|NetRxQueueCreate)\b'
             $out = @()
-            foreach ($x in $f) { $o = Ctx $x $pat 9 40; if ($o) { $out += ('#### ' + (Split-Path $x -Leaf)); $out += $o } }
+            foreach ($x in ($f | Where-Object { $_.FullName -match '\\(2\.0|1\.\d)\\' -or $true })) { $o = Ctx $x.FullName $pat 9 40; if ($o) { $out += ('#### ' + $x.FullName.Replace($inc,'')); $out += $o } }
             Emit "nacapi" ($out -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

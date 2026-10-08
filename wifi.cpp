@@ -17,11 +17,13 @@
 #include "dot11wificxtypes.hpp"
 #include "TLVGeneratorParser.hpp"
 #include "wifi.h"
+#include "netringiterator.h"   /* MIT, from microsoft/NetAdapter-Cx-Driver-Samples */
 
 #define WIFI_POOL_TAG 'shiW'
 
 /* ------------------------------------------------------------------ */
 /* operator new/delete: the TLV library allocates through these        */
+/* (on ARM64 size_t == ULONG_PTR, so delete(void*,ULONG_PTR) also serves as sized delete) */
 /* ------------------------------------------------------------------ */
 typedef struct _PLACEMENT_NEW_ALLOCATION_CONTEXT {
     size_t cbMaxSize;
@@ -52,9 +54,7 @@ void* __cdecl operator new(size_t size, ULONG_PTR ctx) noexcept
 }
 
 void __cdecl operator delete(void* p) noexcept            { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
-void __cdecl operator delete(void* p, size_t) noexcept    { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
 void __cdecl operator delete[](void* p) noexcept          { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
-void __cdecl operator delete[](void* p, size_t) noexcept  { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
 void __cdecl operator delete(void* p, ULONG_PTR) noexcept   { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
 void __cdecl operator delete[](void* p, ULONG_PTR) noexcept { if (p) ExFreePoolWithTag(p, WIFI_POOL_TAG); }
 

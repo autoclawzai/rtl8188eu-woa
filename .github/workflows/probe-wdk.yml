@@ -15,20 +15,28 @@ jobs:
             function Emit([string]$title, [string]$text) {
               $text = $text.Replace('%','%25').Replace("`r",'').Replace("`n",'%0A')
               $i = 0
-              while ($text.Length -gt 0 -and $i -lt 9) {
+              while ($text.Length -gt 0 -and $i -lt 12) {
                 $n = [Math]::Min(3600, $text.Length)
                 Write-Host ("::notice title=" + $title + "#" + $i + "::" + $text.Substring(0,$n))
                 $text = $text.Substring($n); $i++
               }
             }
-            $f = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0\TlvGenerated_.hpp"
-            $raw = (Get-ChildItem $root -Include *.h,*.hpp -Recurse | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+            $files = Get-ChildItem $root -Include *.h,*.hpp -Recurse
+            $names = @('WDI_SET_ADD_CIPHER_KEYS_PARAMETERS','WDI_SET_DELETE_CIPHER_KEYS_PARAMETERS','WDI_SET_DEFAULT_KEY_ID_PARAMETERS','WDI_TASK_DISCONNECT_PARAMETERS','WDI_SET_ADD_CIPHER_KEYS_CONTAINER','WDI_CIPHER_KEY_TYPE_INFO_CONTAINER','WDI_CIPHER_CCMP_KEY','WDI_CONNECT_PARAMETERS_CONTAINER','WDI_CIPHER_KEY_DIRECTION','WDI_CIPHER_KEY_TYPE')
             $out = @()
-            $lines = $raw -split "`n"
-            for ($i=0; $i -lt $lines.Length; $i++) {
-              if ($lines[$i] -match 'WDI_PHY_TYPE_CONTAINER|WDI_PHY_TYPE_LIST_CONTAINER') {
-                $out += ('## L' + $i + ': ' + (($lines[[Math]::Max(0,$i-4)..([Math]::Min($lines.Length-1,$i+3))] -join ' ') -replace '\s+',' '))
+            foreach ($f in $files) {
+              $lines = Get-Content $f.FullName
+              for ($i=0; $i -lt $lines.Length; $i++) {
+                foreach ($n in $names) {
+                  if ($lines[$i] -match ('(struct|class|enum|typedef)\s+(_)?' + $n + '\b')) {
+                    $end = [Math]::Min($lines.Length-1, $i+40)
+                    $blk = @()
+                    for ($j=$i; $j -le $end; $j++) { $blk += ($lines[$j] -replace '\s+',' '); if ($lines[$j] -match '^\s*\};?\s*$' -and $j -gt $i+1) { break } }
+                    $out += ('## ' + $f.Name + ':' + $i + ' ' + ($blk -join ' | '))
+                  }
+                }
               }
             }
-            Emit "structs" ($out -join "`n")
+            $msg = Get-ChildItem $root -Include *.h,*.hpp -Recurse | Select-String -Pattern 'WDI_SET_ADD_CIPHER_KEYS\b|WDI_SET_DELETE_CIPHER_KEYS\b|WDI_SET_DEFAULT_KEY_ID\b|ParseWdiSetAddCipherKeysToIhv|ParseWdiSetDeleteCipherKeysToIhv|ParseWdiSetDefaultKeyIdToIhv|ParseWdiTaskDisconnectToIhv|CleanupParsedWdiSetAddCipherKeys' | Select-Object -First 30 | ForEach-Object { '@@ ' + $_.Filename + ':' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
+            Emit "structs" (($out + $msg) -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

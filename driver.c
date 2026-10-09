@@ -180,7 +180,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
-    ULONG           TxAll, TxCls[5], TxFirstMs, TxLastMs, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[10], DbgRxLen[12]; ULONG DbgRxMs[12], DbgTxMs[10];
+    ULONG           RxNativeMode, TxNative, RxNative, TxAll, TxCls[5], TxFirstMs, TxLastMs, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[10], DbgRxLen[12]; ULONG DbgRxMs[12], DbgTxMs[10];
     UCHAR           DbgTx[10][96], DbgRx[12][96];
     ULONG           RxDataAny, RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
@@ -1342,6 +1342,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     UCHAR req[440];
 
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
+    c->RxNativeMode = RegGetUlong(dev, L"Cfg_RxNative", 1);
     Join_StopScan(c);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;
@@ -1423,13 +1424,13 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
 
 static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
 {
-    ULONG st[12] = {0};
-    static const PCWSTR nm[12] = { L"Log_Dp_TxQCreated", L"Log_Dp_RxQCreated", L"Log_Dp_TxAdv", L"Log_Dp_TxPkt",
+    ULONG st[15] = {0};
+    static const PCWSTR nm[15] = { L"Log_Dp_TxQCreated", L"Log_Dp_RxQCreated", L"Log_Dp_TxAdv", L"Log_Dp_TxPkt",
         L"Log_Dp_TxSubmitOk", L"Log_Dp_TxSubmitFail", L"Log_Dp_TxLastSt", L"Log_Dp_RxAdv", L"Log_Dp_RxArm",
-        L"Log_Dp_RxInd", L"Log_Dp_RxRingDrop", L"Log_Dp_RxNotify" };
+        L"Log_Dp_RxInd", L"Log_Dp_RxRingDrop", L"Log_Dp_RxNotify", L"Log_Dp_TxL2Type", L"Log_Dp_TxL2HdrLen", L"Log_Dp_TxL3Type" };
     ULONG i;
-    WifiCx_GetDataStats(dev, st, 12);
-    for (i = 0; i < 12; i++) RegLog(dev, nm[i], st[i]);
+    WifiCx_GetDataStats(dev, st, 15);
+    for (i = 0; i < 15; i++) RegLog(dev, nm[i], st[i]);
     RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
     RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
     RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
@@ -1448,6 +1449,8 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_DataAny", c->RxDataAny);
     RegLog(dev, L"Log_Dbg_TxAllSinceUp", c->TxAll);
     { ULONG q; WCHAR cn[24]; for (q = 0; q < 5; q++) { RtlStringCbPrintfW(cn, sizeof(cn), L"Log_Dbg_TxCls%u", q); RegLog(dev, cn, c->TxCls[q]); } }
+    RegLog(dev, L"Log_Dbg_TxNative", c->TxNative);
+    RegLog(dev, L"Log_Dbg_RxNative", c->RxNative);
     RegLog(dev, L"Log_Dbg_TxFirstMs", c->TxFirstMs);
     RegLog(dev, L"Log_Dbg_TxLastMs", c->TxLastMs);
     {
@@ -1594,6 +1597,14 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
         if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) { c->RxFlt[1]++; return; }
         if (sub & 0x04) { c->RxFlt[2]++; return; }                         /* null / no-data subtypes */
         if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) { c->RxFlt[3]++; return; }
+        if (c->RxNativeMode) {                              /* WiFiCx wants native 802.11 frames (no FCS) */
+            if (fl & 0x40) { c->DataRxDrop++; return; }
+            if (len < 28) return;
+            c->DataRx++;
+            c->RxNative++;
+            WifiCx_OnRxFrame(c->Self, f, len - 4);
+            return;
+        }
         if (sub & 0x08) hdr += 2;                           /* QoS control */
         if ((fl & 0x80) && (sub & 0x08)) hdr += 4;          /* HT control */
         if (fl & 0x40) {                                    /* protected: hw decrypted keeps CCMP hdr + MIC */
@@ -1677,6 +1688,15 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
     }
     idx = c->TxQHead % TXQ_N;
     f = c->TxQ[idx];
+    if (len >= 32 && len <= TXQ_BUF && (eth[0] & 0x0F) == 0x08 && (eth[1] & 3) == 1 &&
+        RtlEqualMemory(eth + 4, c->JoinBssid, 6)) {
+        /* WiFiCx native 802.11 data frame (header + LLC already built by Windows): pass through */
+        RtlCopyMemory(f, eth, len);
+        f[2] = f[3] = 0;                                       /* duration/ID: let the hardware fill it */
+        RtlCopyMemory(f + 10, c->Mac, 6);
+        fl = len;
+        c->TxNative++;
+    } else {
     RtlZeroMemory(f, 26);
     {
         ULONG hl = 24;
@@ -1690,6 +1710,7 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
         f[hl + 6] = eth[12]; f[hl + 7] = eth[13];              /* ethertype */
         RtlCopyMemory(f + hl + 8, eth + 14, len - 14);
         fl = hl + 8 + len - 14;
+    }
     }
     c->TxAll++;
     {

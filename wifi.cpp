@@ -101,8 +101,10 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 static WDFDEVICE g_WifiDevice;     /* one adapter per driver instance */
 /* data-path debug counters (logged from driver.c every 2 s while connected) */
 enum { ST_TXQ_CREATED, ST_RXQ_CREATED, ST_TX_ADV, ST_TX_PKT, ST_TX_SUBMIT_OK, ST_TX_SUBMIT_FAIL, ST_TX_LASTST,
-       ST_RX_ADV, ST_RX_ARM, ST_RX_IND, ST_RX_DROP, ST_RX_NOTIFY, ST_N };
+       ST_RX_ADV, ST_RX_ARM, ST_RX_IND, ST_RX_DROP, ST_RX_NOTIFY, ST_TX_L2, ST_TX_L2HDR, ST_TX_L3, ST_N };
 static volatile LONG g_St[ST_N];
+static volatile LONG g_RxL2 = -1;   /* Layer2Type seen on TX packets; RX uses the same */
+static volatile LONG g_RxL2Hdr = 0;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WIFI_CTX, GetWifiCtx)
 
@@ -458,6 +460,11 @@ static VOID EvtTxAdvance(NETPACKETQUEUE q)
     while (NetPacketIteratorHasAny(&pi)) {
         NET_PACKET* pkt = NetPacketIteratorGetPacket(&pi);
         InterlockedIncrement(&g_St[ST_TX_PKT]);
+        InterlockedExchange(&g_St[ST_TX_L2], (LONG)pkt->Layout.Layer2Type);
+        InterlockedExchange(&g_St[ST_TX_L2HDR], (LONG)pkt->Layout.Layer2HeaderLength);
+        InterlockedExchange(&g_St[ST_TX_L3], (LONG)pkt->Layout.Layer3Type);
+        InterlockedExchange(&g_RxL2, (LONG)pkt->Layout.Layer2Type);
+        InterlockedExchange(&g_RxL2Hdr, (LONG)pkt->Layout.Layer2HeaderLength);
         if (!pkt->Ignore) {
             UCHAR tmp[1536];
             ULONG n = 0;
@@ -535,7 +542,8 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
             pkt->FragmentIndex = NetFragmentIteratorGetIndex(&fi);
             pkt->FragmentCount = 1;
             pkt->Layout = {};
-            pkt->Layout.Layer2Type = NetPacketLayer2TypeEthernet;
+            pkt->Layout.Layer2Type = (g_RxL2 >= 0) ? (NET_PACKET_LAYER2_TYPE)g_RxL2 : NetPacketLayer2TypeEthernet;
+            pkt->Layout.Layer2HeaderLength = (g_RxL2 >= 0) ? (UINT8)g_RxL2Hdr : 0;
             NetFragmentIteratorAdvance(&fi);
             NetPacketIteratorAdvance(&pi);
             InterlockedIncrement(&g_St[ST_RX_IND]);
@@ -629,6 +637,27 @@ extern "C" VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR* Da, const UCHAR* 
         d[12] = EtherType[0]; d[13] = EtherType[1];
         RtlCopyMemory(d + 14, Payload, PayloadLen);
         w->RxLen[idx] = (USHORT)(14 + PayloadLen);
+        w->RxHead++;
+        if (InterlockedExchange(&w->RxNotifyArmed, 0)) q = w->RxQueue;
+    } else {
+        w->RxDropped++;
+    }
+    KeReleaseSpinLock(&w->RxLock, irql);
+    if (q) { InterlockedIncrement(&g_St[ST_RX_NOTIFY]); NetRxQueueNotifyMoreReceivedPacketsAvailable(q); }
+}
+
+extern "C" VOID WifiCx_OnRxFrame(WDFDEVICE Device, const UCHAR* Frame, ULONG Len)
+{
+    PWIFI_CTX w = GetWifiCtx(Device);
+    KIRQL irql;
+    NETPACKETQUEUE q = nullptr;
+
+    if (Len > sizeof(w->Rx[0]) || Len < 24) return;
+    KeAcquireSpinLock(&w->RxLock, &irql);
+    if (w->RxHead - w->RxTail < 64) {
+        ULONG idx = w->RxHead % 64;
+        RtlCopyMemory(w->Rx[idx], Frame, Len);
+        w->RxLen[idx] = (USHORT)Len;
         w->RxHead++;
         if (InterlockedExchange(&w->RxNotifyArmed, 0)) q = w->RxQueue;
     } else {

@@ -178,6 +178,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxQ[TXQ_N][TXQ_BUF];
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
+    volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
     ULONG           RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
@@ -265,6 +266,19 @@ static VOID RegLog(WDFDEVICE dev, PCWSTR name, ULONG value)
     RtlInitUnicodeString(&nm, name);
     (VOID)WdfRegistryAssignULong(key, &nm, value);
     WdfRegistryClose(key);
+}
+
+static ULONG RegGetUlong(WDFDEVICE dev, PCWSTR name, ULONG def)
+{
+    WDFKEY key;
+    UNICODE_STRING nm;
+    ULONG v = def;
+    if (!NT_SUCCESS(WdfDeviceOpenRegistryKey(dev, PLUGPLAY_REGKEY_DEVICE, KEY_READ,
+                                             WDF_NO_OBJECT_ATTRIBUTES, &key))) return def;
+    RtlInitUnicodeString(&nm, name);
+    if (!NT_SUCCESS(WdfRegistryQueryULong(key, &nm, &v))) v = def;
+    WdfRegistryClose(key);
+    return v;
 }
 
 static VOID RegLogStr(WDFDEVICE dev, PCWSTR name, PCWSTR value)
@@ -1104,12 +1118,25 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     ULONG seq;
     UCHAR i;
     PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
-    WDFUSBPIPE pipe = mgmt ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
+    LONG mode = mgmt ? 0 : c->TxMode;
+    ULONG queue = 0, rate = TXD_RATE_DATA;
+    BOOLEAN useMgmtPipe = FALSE, qos = (BOOLEAN)(frame[0] == 0x88);
+    WDFUSBPIPE pipe;
     WDF_MEMORY_DESCRIPTOR md;
     WDF_REQUEST_SEND_OPTIONS opts;
     ULONG_PTR written = 0;
     NTSTATUS st;
 
+    switch (mode) {
+    case 1: queue = 0x12; useMgmtPipe = TRUE; break;      /* data frames through the MGNT queue / ep 0x02 */
+    case 3: rate = 0; break;                               /* 1M CCK */
+    case 4: queue = 0x11; useMgmtPipe = TRUE; break;      /* HIGH queue / ep 0x02 */
+    case 5: rate = 4; break;                               /* 6M OFDM */
+    case 6: queue = 0x00; useMgmtPipe = TRUE; break;      /* BE queue but through ep 0x02 */
+    case 7: queue = 0x12; rate = 0; useMgmtPipe = TRUE; break;
+    default: break;                                        /* 0, 2: BE / ep 0x03 / 11M (2 = QoS header, built by the producer) */
+    }
+    pipe = (mgmt || useMgmtPipe) ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
     if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
 
     WdfWaitLockAcquire(c->TxLock, NULL);
@@ -1119,11 +1146,11 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     f[23] = (UCHAR)((seq << 4) >> 8);
 
     w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
-    w[1] = mgmt ? 0x00001200u : 0u;
+    w[1] = mgmt ? 0x00001200u : (queue << 8);
     w[2] = 0x03010000u;
     w[3] = seq << 16;
-    w[4] = 0x00000100u;
-    w[5] = mgmt ? 0x001A0000u : (0x0001FF00u | TXD_RATE_DATA);
+    w[4] = 0x00000100u | (qos ? 0x40u : 0u);
+    w[5] = mgmt ? 0x001A0000u : (queue == 0x12 ? (0x001A0000u | rate) : (0x0001FF00u | rate));
     w[6] = 0;
     w[7] = 0x20000000u;
     for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
@@ -1247,6 +1274,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     ULONG tries, n;
     UCHAR req[440];
 
+    c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
     Join_StopScan(c);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;
@@ -1360,6 +1388,8 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     if (c->Stopping) return;
+    c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
+    RegLog(dev, L"Log_TxMode_Active", (ULONG)c->TxMode);
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }
@@ -1533,15 +1563,20 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
     }
     idx = c->TxQHead % TXQ_N;
     f = c->TxQ[idx];
-    RtlZeroMemory(f, 24);
-    f[0] = 0x08; f[1] = 0x01;                      /* data, To-DS */
-    RtlCopyMemory(f + 4, c->JoinBssid, 6);         /* A1 = BSSID */
-    RtlCopyMemory(f + 10, c->Mac, 6);              /* A2 = SA   */
-    RtlCopyMemory(f + 16, eth, 6);                 /* A3 = DA   */
-    f[24] = 0xAA; f[25] = 0xAA; f[26] = 0x03; f[27] = 0; f[28] = 0; f[29] = 0;
-    f[30] = eth[12]; f[31] = eth[13];              /* ethertype */
-    RtlCopyMemory(f + 32, eth + 14, len - 14);
-    fl = 32 + len - 14;
+    RtlZeroMemory(f, 26);
+    {
+        ULONG hl = 24;
+        if (c->TxMode == 2) { f[0] = 0x88; hl = 26; }          /* QoS data, TID 0 */
+        else f[0] = 0x08;
+        f[1] = 0x01;                                           /* To-DS */
+        RtlCopyMemory(f + 4, c->JoinBssid, 6);                 /* A1 = BSSID */
+        RtlCopyMemory(f + 10, c->Mac, 6);                      /* A2 = SA   */
+        RtlCopyMemory(f + 16, eth, 6);                         /* A3 = DA   */
+        f[hl] = 0xAA; f[hl + 1] = 0xAA; f[hl + 2] = 0x03; f[hl + 3] = 0; f[hl + 4] = 0; f[hl + 5] = 0;
+        f[hl + 6] = eth[12]; f[hl + 7] = eth[13];              /* ethertype */
+        RtlCopyMemory(f + hl + 8, eth + 14, len - 14);
+        fl = hl + 8 + len - 14;
+    }
     /* TxQ[idx][16] is A3[0]: used by the worker for the multicast bit */
     c->TxQLen[idx] = (USHORT)fl;
     c->TxQHead++;

@@ -1248,6 +1248,22 @@ static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
     CHK(Rtl_Write8(c, REG_SLOT_, (c->JoinCap & 0x0400) ? 9 : 20));
     CHK(Rmw32(c, REG_RCR_, 0, 0x0000080Eu));                    /* APM | AM | AB | accept data frames */
     (VOID)Rtl_H2cMediaStatus(c, TRUE, 2 /* AP */, 0);
+
+    /* --- values seen in the Linux rtl8xxxu capture right after association --- */
+    CHK(Rtl_Write32(c, 0x0440, 0x0008015Fu));                   /* RRSR: response rate set       */
+    CHK(Rtl_Write8 (c, 0x0480, 0x03));                          /* INIRTS_RATE_SEL               */
+    CHK(Rmw8       (c, 0x0422, 0x40, 0));                       /* stop TX beacon queue download */
+    CHK(Rtl_Write8 (c, 0x0541, 0x64));                          /* TBTT prohibit                 */
+    CHK(Rmw8       (c, 0x0542, 0x01, 0));
+    CHK(Rtl_Write32(c, 0x0500, 0x002F3222u));                   /* EDCA VO */
+    CHK(Rtl_Write32(c, 0x0504, 0x005E4322u));                   /* EDCA VI */
+    CHK(Rtl_Write32(c, 0x0508, 0x0000A42Bu));                   /* EDCA BE */
+    CHK(Rtl_Write32(c, 0x050C, 0x0000A44Fu));                   /* EDCA BK */
+    CHK(Rtl_Write8 (c, 0x0458, 0x41));
+    CHK(Rtl_Write8 (c, 0x0459, 0xA8));
+    CHK(Rtl_Write8 (c, 0x045A, 0x72));
+    CHK(Rtl_Write8 (c, 0x045B, 0xB9));
+    CHK(Rtl_Write8 (c, 0x045C, 0x04));
     return STATUS_SUCCESS;
 }
 

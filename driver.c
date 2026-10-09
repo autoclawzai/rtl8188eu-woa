@@ -179,7 +179,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
-    ULONG           RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
+    ULONG           RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -1246,7 +1246,7 @@ static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
     CHK(Rtl_Write16(c, REG_BCN_PSR_RPT_, (USHORT)(0xC000 | c->JoinAid)));
     CHK(Rmw8(c, REG_BEACON_CTRL_, 0x10, 0));                    /* allow TSF update from the AP */
     CHK(Rtl_Write8(c, REG_SLOT_, (c->JoinCap & 0x0400) ? 9 : 20));
-    CHK(Rmw32(c, REG_RCR_, 0, 0x0000080Eu));                    /* APM | AM | AB | accept data frames */
+    CHK(Rmw32(c, REG_RCR_, 0, 0xCE60087Eu));                    /* APM | AM | AB | accept data frames */
     (VOID)Rtl_H2cMediaStatus(c, TRUE, 2 /* AP */, 0);
 
     /* --- values seen in the Linux rtl8xxxu capture right after association --- */
@@ -1391,6 +1391,14 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_FltLlc", c->RxFlt[5]);
     RegLog(dev, L"Log_Rx_FirstFc", c->RxFirstFc);
     RegLog(dev, L"Log_Rx_FirstV0", c->RxFirstV0);
+    for (i = 0; i < 48; i++) {
+        WCHAR n1[] = L"Log_RxH_T0S00", n2[] = L"Log_RxU_T0S00";
+        n1[10] = n2[10] = (WCHAR)(L'0' + i / 16);
+        n1[12] = n2[12] = (WCHAR)(L'0' + (i % 16) / 10);
+        n1[13] = n2[13] = (WCHAR)(L'0' + (i % 16) % 10);
+        if (c->RxH[i]) RegLog(dev, n1, c->RxH[i]);
+        if (c->RxU[i]) RegLog(dev, n2, c->RxU[i]);
+    }
 }
 
 VOID EvtStatsTimer(WDFTIMER timer)
@@ -1459,10 +1467,15 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
 {
     UCHAR type, sub, fl;
     LONG state = c->JoinState;
-    if (len < 24) return;
+    if (len < 10) return;
     type = (UCHAR)((f[0] >> 2) & 3);
     sub  = (UCHAR)(f[0] >> 4);
     fl   = f[1];
+    if (type < 3) {
+        c->RxH[type * 16 + sub]++;
+        if (len >= 10 && RtlEqualMemory(f + 4, c->Mac, 6)) c->RxU[type * 16 + sub]++;
+    }
+    if (len < 24) return;
 
     if (type == 0) {
         if (!RtlEqualMemory(f + 10, c->JoinBssid, 6)) return;

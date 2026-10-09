@@ -180,6 +180,8 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
+    ULONG           DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[3], DbgRxLen[12]; ULONG DbgRxMs[12];
+    UCHAR           DbgTx[3][96], DbgRx[12][96];
     ULONG           RxDataAny, RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
@@ -1379,6 +1381,8 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     st = Join_HwUp(c);
     RegLog(dev, L"Log_Join_HwUp", (ULONG)st);
     if (!NT_SUCCESS(st)) return st;
+    c->UpMs = KeQueryInterruptTime() / 10000;
+    c->DbgTxN = c->DbgRxN = 0;
     InterlockedExchange(&c->JoinState, JOIN_UP);
     WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     Join_SelfTest(dev, c);
@@ -1442,6 +1446,23 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_FirstFc", c->RxFirstFc);
     RegLog(dev, L"Log_Rx_FirstV0", c->RxFirstV0);
     RegLog(dev, L"Log_Rx_DataAny", c->RxDataAny);
+    {
+        static const WCHAR hx[] = L"0123456789abcdef";
+        WCHAR buf[260], nm[24];
+        ULONG k, j, n;
+        for (k = 0; k < 15; k++) {
+            const UCHAR *src; ULONG len, nb, ms = 0;
+            if (k < 3) { if (k >= c->DbgTxN) continue; src = c->DbgTx[k]; len = c->DbgTxLen[k]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgTx%u", k); }
+            else { if (k - 3 >= c->DbgRxN) continue; src = c->DbgRx[k-3]; len = c->DbgRxLen[k-3]; ms = c->DbgRxMs[k-3]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgRx%02u", k - 3); }
+            nb = len > 96 ? 96 : len;
+            n = 0;
+            RtlStringCbPrintfW(buf, sizeof(buf), L"ms=%u len=%u ", ms, len);
+            n = (ULONG)wcslen(buf);
+            for (j = 0; j < nb && n + 3 < 258; j++) { buf[n++] = hx[src[j] >> 4]; buf[n++] = hx[src[j] & 15]; }
+            buf[n] = 0;
+            RegLogStr(dev, nm, buf);
+        }
+    }
     for (i = 0; i < 48; i++) {
         WCHAR n1[] = L"Log_RxH_T0S00", n2[] = L"Log_RxU_T0S00";
         n1[9] = n2[9] = (WCHAR)(L'0' + i / 16);
@@ -1525,7 +1546,15 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
     if (type < 3) {
         c->RxH[type * 16 + sub]++;
         if (len >= 10 && RtlEqualMemory(f + 4, c->Mac, 6)) c->RxU[type * 16 + sub]++;
-        if (type == 2 && !(sub & 4)) c->RxDataAny++;
+        if (type == 2 && !(sub & 4)) {
+            c->RxDataAny++;
+            if (c->DbgRxN < 12) {
+                ULONG k = c->DbgRxN++, n = len > 96 ? 96 : len;
+                RtlCopyMemory(c->DbgRx[k], f, n);
+                c->DbgRxLen[k] = (USHORT)len;
+                c->DbgRxMs[k] = (ULONG)(KeQueryInterruptTime() / 10000 - c->UpMs);
+            }
+        }
     }
     if (len < 24) return;
 
@@ -1657,6 +1686,11 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
         f[hl + 6] = eth[12]; f[hl + 7] = eth[13];              /* ethertype */
         RtlCopyMemory(f + hl + 8, eth + 14, len - 14);
         fl = hl + 8 + len - 14;
+    }
+    if (c->DbgTxN < 3) {
+        ULONG k = c->DbgTxN++, n = fl > 96 ? 96 : fl;
+        RtlCopyMemory(c->DbgTx[k], f, n);
+        c->DbgTxLen[k] = (USHORT)fl;
     }
     /* TxQ[idx][16] is A3[0]: used by the worker for the multicast bit */
     c->TxQLen[idx] = (USHORT)fl;

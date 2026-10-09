@@ -45,7 +45,7 @@ Start-Sleep 6
 $dev = Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_2357&PID_010C' } | Select-Object -First 1
 $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"
 "--- Device Parameters ---" | Out-File $out -Append
-(Get-ItemProperty $key).PSObject.Properties | Where-Object { $_.Name -match '^(Log_(Join|Wifi|TxPipe|Tx_|Data|Dp|Rx|Test))' } |
+(Get-ItemProperty $key).PSObject.Properties | Where-Object { $_.Name -match '^(Log_(Join|Wifi|TxPipe|Tx_|Data|Dp|Rx|Test|Dbg))' } |
   Sort-Object Name | ForEach-Object { "{0} = {1}" -f $_.Name, $_.Value } | Out-File $out -Append
 "--- Get-NetAdapter ---" | Out-File $out -Append
 Get-NetAdapter | Format-Table Name,InterfaceDescription,Status,MacAddress -AutoSize | Out-String | Out-File $out -Append

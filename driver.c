@@ -180,7 +180,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
-    ULONG           DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[3], DbgRxLen[12]; ULONG DbgRxMs[12];
+    ULONG           TxAll, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[3], DbgRxLen[12]; ULONG DbgRxMs[12];
     UCHAR           DbgTx[3][96], DbgRx[12][96];
     ULONG           RxDataAny, RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
@@ -1322,7 +1322,7 @@ static NTSTATUS Tx_TestFrame(PDEVICE_CONTEXT c, ULONG w4, ULONG w5, ULONG w2)
 static VOID Join_SelfTest(WDFDEVICE dev, PDEVICE_CONTEXT c)
 {
     ULONG before, k;
-    if (!RegGetUlong(dev, L"Cfg_SelfTest", 1)) return;
+    if (!RegGetUlong(dev, L"Cfg_SelfTest", 0)) return;
     SleepMs(300);
     before = c->RxDataAny;
     for (k = 0; k < 3; k++) { (VOID)Tx_TestFrame(c, 0x0102B148u, 0x0001FF13u, 0x03410000u); SleepMs(150); }
@@ -1382,7 +1382,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Join_HwUp", (ULONG)st);
     if (!NT_SUCCESS(st)) return st;
     c->UpMs = KeQueryInterruptTime() / 10000;
-    c->DbgTxN = c->DbgRxN = 0;
+    c->DbgTxN = c->DbgRxN = 0; c->TxAll = 0;
     InterlockedExchange(&c->JoinState, JOIN_UP);
     WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     Join_SelfTest(dev, c);
@@ -1446,6 +1446,8 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_FirstFc", c->RxFirstFc);
     RegLog(dev, L"Log_Rx_FirstV0", c->RxFirstV0);
     RegLog(dev, L"Log_Rx_DataAny", c->RxDataAny);
+    RegLog(dev, L"Log_Dbg_TxAllSinceUp", c->TxAll);
+    RegLog(dev, L"Log_Dbg_DhcpTxCaptured", c->DbgTxN);
     {
         static const WCHAR hx[] = L"0123456789abcdef";
         WCHAR buf[260], nm[24];
@@ -1687,7 +1689,8 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
         RtlCopyMemory(f + hl + 8, eth + 14, len - 14);
         fl = hl + 8 + len - 14;
     }
-    if (c->DbgTxN < 3) {
+    c->TxAll++;
+    if (c->DbgTxN < 3 && fl > 24 + 8 + 28 && f[24 + 6] == 0x08 && f[24 + 7] == 0x00 && f[32 + 9] == 17 && f[32 + 22] == 0 && f[32 + 23] == 67) {
         ULONG k = c->DbgTxN++, n = fl > 96 ? 96 : fl;
         RtlCopyMemory(c->DbgTx[k], f, n);
         c->DbgTxLen[k] = (USHORT)fl;

@@ -180,8 +180,8 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
-    ULONG           TxAll, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[3], DbgRxLen[12]; ULONG DbgRxMs[12];
-    UCHAR           DbgTx[3][96], DbgRx[12][96];
+    ULONG           TxAll, TxCls[5], TxFirstMs, TxLastMs, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[10], DbgRxLen[12]; ULONG DbgRxMs[12], DbgTxMs[10];
+    UCHAR           DbgTx[10][96], DbgRx[12][96];
     ULONG           RxDataAny, RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
@@ -1382,7 +1382,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Join_HwUp", (ULONG)st);
     if (!NT_SUCCESS(st)) return st;
     c->UpMs = KeQueryInterruptTime() / 10000;
-    c->DbgTxN = c->DbgRxN = 0; c->TxAll = 0;
+    c->DbgTxN = c->DbgRxN = 0; c->TxAll = 0; RtlZeroMemory(c->TxCls, sizeof(c->TxCls)); c->TxFirstMs = c->TxLastMs = 0;
     InterlockedExchange(&c->JoinState, JOIN_UP);
     WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     Join_SelfTest(dev, c);
@@ -1447,15 +1447,17 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_FirstV0", c->RxFirstV0);
     RegLog(dev, L"Log_Rx_DataAny", c->RxDataAny);
     RegLog(dev, L"Log_Dbg_TxAllSinceUp", c->TxAll);
-    RegLog(dev, L"Log_Dbg_DhcpTxCaptured", c->DbgTxN);
+    { ULONG q; WCHAR cn[24]; for (q = 0; q < 5; q++) { RtlStringCbPrintfW(cn, sizeof(cn), L"Log_Dbg_TxCls%u", q); RegLog(dev, cn, c->TxCls[q]); } }
+    RegLog(dev, L"Log_Dbg_TxFirstMs", c->TxFirstMs);
+    RegLog(dev, L"Log_Dbg_TxLastMs", c->TxLastMs);
     {
         static const WCHAR hx[] = L"0123456789abcdef";
         WCHAR buf[260], nm[24];
         ULONG k, j, n;
-        for (k = 0; k < 15; k++) {
+        for (k = 0; k < 22; k++) {
             const UCHAR *src; ULONG len, nb, ms = 0;
-            if (k < 3) { if (k >= c->DbgTxN) continue; src = c->DbgTx[k]; len = c->DbgTxLen[k]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgTx%u", k); }
-            else { if (k - 3 >= c->DbgRxN) continue; src = c->DbgRx[k-3]; len = c->DbgRxLen[k-3]; ms = c->DbgRxMs[k-3]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgRx%02u", k - 3); }
+            if (k < 10) { if (!(c->DbgTxN & (1u << k))) continue; src = c->DbgTx[k]; len = c->DbgTxLen[k]; ms = c->DbgTxMs[k]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgTxC%u_%u", k / 2, k % 2); }
+            else { if (k - 10 >= c->DbgRxN) continue; src = c->DbgRx[k-10]; len = c->DbgRxLen[k-10]; ms = c->DbgRxMs[k-10]; RtlStringCbPrintfW(nm, sizeof(nm), L"Log_DbgRx%02u", k - 10); }
             nb = len > 96 ? 96 : len;
             n = 0;
             RtlStringCbPrintfW(buf, sizeof(buf), L"ms=%u len=%u ", ms, len);
@@ -1690,10 +1692,22 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
         fl = hl + 8 + len - 14;
     }
     c->TxAll++;
-    if (c->DbgTxN < 3 && fl > 24 + 8 + 28 && f[24 + 6] == 0x08 && f[24 + 7] == 0x00 && f[32 + 9] == 17 && f[32 + 22] == 0 && f[32 + 23] == 67) {
-        ULONG k = c->DbgTxN++, n = fl > 96 ? 96 : fl;
-        RtlCopyMemory(c->DbgTx[k], f, n);
-        c->DbgTxLen[k] = (USHORT)fl;
+    {
+        ULONG cls = 4, ms = (ULONG)(KeQueryInterruptTime() / 10000 - c->UpMs);
+        if (fl > 32) {
+            if (f[24 + 6] == 0x08 && f[24 + 7] == 0x06) cls = 0;
+            else if (f[24 + 6] == 0x08 && f[24 + 7] == 0x00) cls = (fl > 58 && f[32 + 9] == 17 && f[32 + 22] == 0 && f[32 + 23] == 67) ? 1 : 2;
+            else if (f[24 + 6] == 0x86 && f[24 + 7] == 0xDD) cls = 3;
+        }
+        if (c->TxAll == 1) c->TxFirstMs = ms;
+        c->TxLastMs = ms;
+        if (c->TxCls[cls]++ < 2) {
+            ULONG k = cls * 2 + (c->TxCls[cls] - 1), n = fl > 96 ? 96 : fl;
+            RtlCopyMemory(c->DbgTx[k], f, n);
+            c->DbgTxLen[k] = (USHORT)fl;
+            c->DbgTxMs[k] = ms;
+            c->DbgTxN |= 1u << k;
+        }
     }
     /* TxQ[idx][16] is A3[0]: used by the worker for the multicast bit */
     c->TxQLen[idx] = (USHORT)fl;

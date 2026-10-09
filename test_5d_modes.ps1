@@ -13,6 +13,11 @@ function Dump($tag) {
 netsh wlan connect name="$Ssid" | Out-File $out -Append
 Start-Sleep 8
 netsh wlan show interfaces | Select-String 'State|SSID|BSSID|Channel' | Out-File $out -Append
+Start-Sleep 4
+if ($null -eq (Get-ItemProperty $key).Log_TxMode_Active) {
+  "!!! Log_TxMode_Active nahi mila: device pe PURANA driver hai. Pehle naye dist folder se .\test_5d.ps1 -Ssid $Ssid chalao, phir ye script." | Tee-Object -FilePath $out -Append
+  return
+}
 foreach ($m in 0,1,2,3,4,5,6,7) {
   Set-ItemProperty -Path $key -Name Cfg_TxMode -Value $m -Type DWord
   Start-Sleep 5

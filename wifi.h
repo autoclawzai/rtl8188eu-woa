@@ -41,6 +41,8 @@ VOID WifiCx_OnRxFrame(WDFDEVICE Device, const UCHAR *Frame, ULONG Len);   /* nat
 NTSTATUS Rtl_WifiConnect(WDFDEVICE Device, const UCHAR *Bssid, const UCHAR *Ssid, ULONG SsidLen, UCHAR Channel,
                          const UCHAR *ExtIe, ULONG ExtIeLen);
 VOID     Rtl_WifiDisconnect(WDFDEVICE Device);
+/* phase 5d-B: op 1 = add, 2 = delete; key16 = CCMP TK; mac may be NULL (group key -> BSSID) */
+NTSTATUS Rtl_WifiKey(WDFDEVICE Device, ULONG Op, BOOLEAN Group, UCHAR KeyId, const UCHAR *Mac, const UCHAR *Key16);
 NTSTATUS Rtl_TxEthernet(WDFDEVICE Device, const UCHAR *Eth, ULONG Len);
 
 #ifdef __cplusplus

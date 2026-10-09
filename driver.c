@@ -111,6 +111,14 @@ enum { SCAN_PASSIVE = 1, SCAN_ACTIVE = 2, SCAN_DIRECTED = 3 };
 
 
 
+#define KEYQ_N 8
+typedef struct _KEY_REQ {
+    UCHAR Op;                /* 1 add, 2 delete */
+    UCHAR Group, KeyId, HasMac;
+    UCHAR Mac[6];
+    UCHAR Key[16];
+} KEY_REQ;
+
 typedef struct _DEVICE_CONTEXT {
     void           *WdfTriageInfoPtr;       /* MUST be first: NetAdapterCx crash-dump carving */
     WDFUSBDEVICE    UsbDevice;
@@ -156,7 +164,14 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      TxPipeData;             /* bulk OUT for BE queue (second out endpoint) */
     WDFWAITLOCK     TxLock;                 /* serialises TxDataBuf users */
     WDFSPINLOCK     TxQLock;
-    WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork;
+    WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork, KeyWork;
+    /* phase 5d-B: WPA2 / CCMP via the hardware CAM */
+    KEY_REQ         KeyQ[KEYQ_N];
+    ULONG           KeyQHead, KeyQTail;
+    volatile LONG   PtkInstalled;           /* TX encrypts data frames when set */
+    BOOLEAN         SecOn;
+    ULONG64         TxPn;
+    ULONG           RxProt, RxProtDrop, RxProtV0, TxEnc, KeyAdds, KeyDels, KeyLastSt;
     WDFTIMER        StatsTimer;
     KEVENT          JoinEvent;
     volatile LONG   JoinState;
@@ -1123,7 +1138,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
     LONG mode = mgmt ? 0 : c->TxMode;
     ULONG queue = 0, rate = TXD_RATE_DATA;
-    BOOLEAN useMgmtPipe = FALSE, qos = (BOOLEAN)(frame[0] == 0x88);
+    BOOLEAN useMgmtPipe = FALSE, qos = (BOOLEAN)(frame[0] == 0x88), enc = FALSE;
     WDFUSBPIPE pipe;
     WDF_MEMORY_DESCRIPTOR md;
     WDF_REQUEST_SEND_OPTIONS opts;
@@ -1144,12 +1159,32 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
 
     WdfWaitLockAcquire(c->TxLock, NULL);
     seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
-    RtlCopyMemory(f, frame, fl);
+    {
+        /* WPA2: protect unicast/ToDS data frames (not EAPOL) with CCMP. We add the 8 byte CCMP header,
+         * the hardware encrypts and appends the MIC (length in the descriptor excludes the MIC). */
+        ULONG hl = (frame[0] & 0x80) ? 26 : 24;
+        if (!mgmt && c->PtkInstalled && (frame[0] & 0x0C) == 0x08 && fl > hl + 8 && fl + 8 <= TXQ_BUF &&
+            !(frame[hl + 6] == 0x88 && frame[hl + 7] == 0x8E)) {
+            ULONG64 pn = c->TxPn++;
+            RtlCopyMemory(f, frame, hl);
+            f[1] |= 0x40;                                   /* Protected */
+            f[hl + 0] = (UCHAR)pn;         f[hl + 1] = (UCHAR)(pn >> 8);
+            f[hl + 2] = 0;                 f[hl + 3] = 0x20;  /* ExtIV, key id 0 */
+            f[hl + 4] = (UCHAR)(pn >> 16); f[hl + 5] = (UCHAR)(pn >> 24);
+            f[hl + 6] = (UCHAR)(pn >> 32); f[hl + 7] = (UCHAR)(pn >> 40);
+            RtlCopyMemory(f + hl + 8, frame + hl, fl - hl);
+            fl += 8;
+            enc = TRUE;
+            c->TxEnc++;
+        } else {
+            RtlCopyMemory(f, frame, fl);
+        }
+    }
     f[22] = (UCHAR)((seq << 4) & 0xFF);
     f[23] = (UCHAR)((seq << 4) >> 8);
 
     w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
-    w[1] = mgmt ? 0x00001200u : (queue << 8);
+    w[1] = (mgmt ? 0x00001200u : (queue << 8)) | (enc ? 0x00C00000u : 0);
     w[2] = 0x03010000u;
     w[3] = seq << 16;
     w[4] = 0x00000100u | (qos ? 0x40u : 0u);
@@ -1239,10 +1274,126 @@ static NTSTATUS Rtl_H2cMediaStatus(PDEVICE_CONTEXT c, BOOLEAN connect, UCHAR rol
     return st;
 }
 
+
+/* ---- phase 5d-B: security CAM (layout from the Linux rtl8xxxu capture) ---- */
+#define REG_CAMCMD_   0x0670
+#define REG_CAMW_     0x0674
+#define REG_SECCFG_   0x0680
+
+static NTSTATUS Cam_WriteEntry(PDEVICE_CONTEXT c, ULONG entry, BOOLEAN group, UCHAR keyId, const UCHAR *mac, const UCHAR *key)
+{
+    LONG j;
+    NTSTATUS st;
+    ULONG ctrl = (4u << 2) | (keyId & 3) | 0x8000u | (group ? 0x40u : 0);       /* cipher index 4 = CCMP */
+    for (j = 5; j >= 0; j--) {
+        ULONG v;
+        if (j == 0) v = ctrl | ((ULONG)mac[0] << 16) | ((ULONG)mac[1] << 24);
+        else if (j == 1) v = mac[2] | ((ULONG)mac[3] << 8) | ((ULONG)mac[4] << 16) | ((ULONG)mac[5] << 24);
+        else {
+            const UCHAR *k = key + ((j - 2) << 2);
+            v = k[0] | ((ULONG)k[1] << 8) | ((ULONG)k[2] << 16) | ((ULONG)k[3] << 24);
+        }
+        CHK(Rtl_Write32(c, REG_CAMW_, v));
+        CHK(Rtl_Write32(c, REG_CAMCMD_, 0x80010000u | (entry << 3) | (ULONG)j));
+        KeStallExecutionProcessor(100);
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS Cam_Invalidate(PDEVICE_CONTEXT c, ULONG entry)
+{
+    NTSTATUS st;
+    CHK(Rtl_Write32(c, REG_CAMW_, 0));
+    CHK(Rtl_Write32(c, REG_CAMCMD_, 0x80010000u | (entry << 3)));
+    KeStallExecutionProcessor(100);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS Sec_Enable(PDEVICE_CONTEXT c)
+{
+    NTSTATUS st;
+    if (c->SecOn) return STATUS_SUCCESS;
+    CHK(Rmw16(c, 0x0100, 0, 0x0200));                         /* CR: security enable */
+    CHK(Rtl_Write8(c, REG_SECCFG_, 0xCF));
+    c->SecOn = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static VOID Sec_Reset(PDEVICE_CONTEXT c)
+{
+    ULONG e;
+    InterlockedExchange(&c->PtkInstalled, 0);
+    c->TxPn = 1;
+    if (c->SecOn) {
+        for (e = 0; e < 5; e++) (VOID)Cam_Invalidate(c, e);
+        (VOID)Rtl_Write8(c, REG_SECCFG_, 0);
+        c->SecOn = FALSE;
+    }
+}
+
+static VOID EvtKeyWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    for (;;) {
+        KEY_REQ r;
+        NTSTATUS st = STATUS_SUCCESS;
+        ULONG entry;
+        const UCHAR *mac;
+        WdfSpinLockAcquire(c->TxQLock);
+        if (c->KeyQHead == c->KeyQTail) { WdfSpinLockRelease(c->TxQLock); break; }
+        r = c->KeyQ[c->KeyQTail % KEYQ_N];
+        c->KeyQTail++;
+        WdfSpinLockRelease(c->TxQLock);
+        if (c->Stopping || !c->HwReady) continue;
+        mac = r.HasMac ? r.Mac : c->JoinBssid;
+        if (r.Group) entry = (r.KeyId >= 1 && r.KeyId <= 3) ? r.KeyId : 4;
+        else entry = 0;
+        if (r.Op == 1) {
+            st = Sec_Enable(c);
+            if (NT_SUCCESS(st)) st = Cam_WriteEntry(c, entry, r.Group, r.Group ? r.KeyId : 0, mac, r.Key);
+            if (NT_SUCCESS(st) && !r.Group) {
+                c->TxPn = 1;
+                InterlockedExchange(&c->PtkInstalled, 1);
+            }
+            c->KeyAdds++;
+        } else {
+            st = Cam_Invalidate(c, entry);
+            if (!r.Group) InterlockedExchange(&c->PtkInstalled, 0);
+            c->KeyDels++;
+        }
+        c->KeyLastSt = (ULONG)st;
+        RegLog(dev, L"Log_Key_Adds", c->KeyAdds);
+        RegLog(dev, L"Log_Key_Dels", c->KeyDels);
+        RegLog(dev, L"Log_Key_LastSt", c->KeyLastSt);
+        RegLog(dev, L"Log_Key_LastGroup", r.Group);
+        RegLog(dev, L"Log_Key_LastId", r.KeyId);
+        RegLog(dev, L"Log_Key_Ptk", (ULONG)c->PtkInstalled);
+    }
+}
+
+NTSTATUS Rtl_WifiKey(WDFDEVICE dev, ULONG op, BOOLEAN group, UCHAR keyId, const UCHAR *mac, const UCHAR *key16)
+{
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    KEY_REQ *r;
+    WdfSpinLockAcquire(c->TxQLock);
+    if (c->KeyQHead - c->KeyQTail >= KEYQ_N) { WdfSpinLockRelease(c->TxQLock); return STATUS_INSUFFICIENT_RESOURCES; }
+    r = &c->KeyQ[c->KeyQHead % KEYQ_N];
+    RtlZeroMemory(r, sizeof(*r));
+    r->Op = (UCHAR)op; r->Group = group ? 1 : 0; r->KeyId = keyId;
+    if (mac) { r->HasMac = 1; RtlCopyMemory(r->Mac, mac, 6); }
+    if (key16) RtlCopyMemory(r->Key, key16, 16);
+    c->KeyQHead++;
+    WdfSpinLockRelease(c->TxQLock);
+    WdfWorkItemEnqueue(c->KeyWork);
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
 {
     NTSTATUS st;
     UCHAR i;
+    InterlockedExchange(&c->PtkInstalled, 0); c->TxPn = 1;
     for (i = 0; i < 6; i++) CHK(Rtl_Write8(c, (USHORT)(REG_BSSID_ + i), c->JoinBssid[i]));
     CHK(Rmw8(c, REG_MSR_, 0x03, 0x02));                         /* link type: station */
     CHK(Rtl_Write8(c, REG_BCN_MAX_ERR_, 0xFF));
@@ -1272,6 +1423,7 @@ static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
 
 static VOID Join_HwDown(PDEVICE_CONTEXT c)
 {
+    Sec_Reset(c);
     (VOID)Rtl_H2cMediaStatus(c, FALSE, 2, 0);
     (VOID)Rmw8(c, REG_BEACON_CTRL_, 0, 0x10);
     (VOID)Rmw8(c, REG_MSR_, 0x03, 0x00);
@@ -1450,6 +1602,10 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Dbg_TxAllSinceUp", c->TxAll);
     { ULONG q; WCHAR cn[24]; for (q = 0; q < 5; q++) { RtlStringCbPrintfW(cn, sizeof(cn), L"Log_Dbg_TxCls%u", q); RegLog(dev, cn, c->TxCls[q]); } }
     RegLog(dev, L"Log_Dbg_TxNative", c->TxNative);
+    RegLog(dev, L"Log_Sec_TxEnc", c->TxEnc);
+    RegLog(dev, L"Log_Sec_RxProt", c->RxProt);
+    RegLog(dev, L"Log_Sec_RxProtDrop", c->RxProtDrop);
+    RegLog(dev, L"Log_Sec_RxProtV0", c->RxProtV0);
     RegLog(dev, L"Log_Dbg_RxNative", c->RxNative);
     RegLog(dev, L"Log_Dbg_TxFirstMs", c->TxFirstMs);
     RegLog(dev, L"Log_Dbg_TxLastMs", c->TxLastMs);
@@ -1598,7 +1754,21 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
         if (sub & 0x04) { c->RxFlt[2]++; return; }                         /* null / no-data subtypes */
         if (!(f[4] & 1) && !RtlEqualMemory(f + 4, c->Mac, 6)) { c->RxFlt[3]++; return; }
         if (c->RxNativeMode) {                              /* WiFiCx wants native 802.11 frames (no FCS) */
-            if (fl & 0x40) { c->DataRxDrop++; return; }
+            if (fl & 0x40) {                                /* CCMP: hw decrypted, keeps CCMP hdr + MIC */
+                ULONG sec = (v0 >> 20) & 7, swdec = (v0 >> 27) & 1, hl = (sub & 8) ? 26 : 24, body;
+                UCHAR tmp[1600];
+                if ((fl & 0x80) && (sub & 8)) hl += 4;
+                c->RxProt++;
+                if (c->RxProt == 1) c->RxProtV0 = v0;
+                if (swdec || sec == 0 || len < hl + 8 + 8 + 4 + 8 || len > sizeof(tmp) + 20) { c->DataRxDrop++; c->RxProtDrop++; return; }
+                body = len - 4 - 8 - hl - 8;                /* minus FCS, MIC, header, CCMP hdr */
+                RtlCopyMemory(tmp, f, hl);
+                tmp[1] &= (UCHAR)~0x40;
+                RtlCopyMemory(tmp + hl, f + hl + 8, body);
+                c->DataRx++; c->RxNative++;
+                WifiCx_OnRxFrame(c->Self, tmp, hl + body);
+                return;
+            }
             if (len < 28) return;
             c->DataRx++;
             c->RxNative++;
@@ -1834,6 +2004,13 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     st = WdfWorkItemCreate(&wcfg, &attr, &c->LossWork);
     if (!NT_SUCCESS(st)) return st;
 
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtKeyWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->KeyWork);
+    if (!NT_SUCCESS(st)) return st;
+
     WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtTxWork);
     wcfg.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
@@ -2026,6 +2203,7 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     WdfWorkItemFlush(ctx->JoinWork);
     WdfWorkItemFlush(ctx->LossWork);
     WdfWorkItemFlush(ctx->TxWork);
+    WdfWorkItemFlush(ctx->KeyWork);
     /* stop+flush twice: a work item that was already running may re-arm the timer once */
     WdfTimerStop(ctx->ScanTimer, TRUE);
     WdfWorkItemFlush(ctx->ScanWork);

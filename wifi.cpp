@@ -82,6 +82,8 @@ typedef struct _WIFI_CTX {
     UCHAR       ConnChannel;
     UCHAR       ConnBeacon[640];
     ULONG       ConnBeaconLen;
+    BOOLEAN     ConnSecure;         /* WPA2-PSK / CCMP */
+    ULONG       ConnAuth;
     /* RX ring: Ethernet frames waiting for the NetAdapter rx queue (producer = USB completion, DISPATCH) */
     KSPIN_LOCK  RxLock;
     NETPACKETQUEUE RxQueue;
@@ -151,6 +153,40 @@ static VOID SendIndication(WDFDEVICE Device, const WDI_MESSAGE_HEADER& Orig, UIN
 static VOID SendM4(WDFDEVICE Device, UINT16 CompleteId, const WDI_MESSAGE_HEADER& Orig, NTSTATUS Status)
 {
     SendIndication(Device, Orig, CompleteId, Orig.TransactionId, Status, nullptr, 0);
+}
+
+
+/* Builds an RSN IE (WPA2-PSK, CCMP pairwise) from the AP's beacon RSN IE. Returns length, 0 if the AP has none. */
+static ULONG BuildRsnIe(const UINT8* body, ULONG bl, ULONG auth, UCHAR* out, ULONG outMax)
+{
+    static const UCHAR oui[3] = { 0x00, 0x0F, 0xAC };
+    for (ULONG o = 12; body && o + 2 <= bl; ) {
+        UCHAR id = body[o], l = body[o + 1];
+        if (o + 2 + l > bl) break;
+        if (id == 48 && l >= 20 && outMax >= 24) {
+            const UINT8* r = body + o + 2;                      /* version(2) group(4) pcount(2) ... */
+            USHORT pc = (USHORT)(r[6] | (r[7] << 8));
+            ULONG ap = 8 + 4 * (ULONG)pc;
+            if (ap + 2 > l) return 0;
+            USHORT ac = (USHORT)(r[ap] | (r[ap + 1] << 8));
+            ULONG cp = ap + 2 + 4 * (ULONG)ac;
+            USHORT caps = (cp + 2 <= l) ? (USHORT)(r[cp] | (r[cp + 1] << 8)) : 0;
+            caps &= (USHORT)~0x00C0;                            /* no management frame protection */
+            ULONG n = 0;
+            out[n++] = 48; out[n++] = 0;                        /* length patched below */
+            out[n++] = 1;  out[n++] = 0;                        /* version */
+            RtlCopyMemory(out + n, r + 2, 4); n += 4;           /* group cipher: as the AP uses it */
+            out[n++] = 1; out[n++] = 0;                         /* 1 pairwise: CCMP */
+            RtlCopyMemory(out + n, oui, 3); n += 3; out[n++] = 4;
+            out[n++] = 1; out[n++] = 0;                         /* 1 AKM */
+            RtlCopyMemory(out + n, oui, 3); n += 3; out[n++] = (auth == 6) ? 1 : 2;   /* 1 = 802.1X, 2 = PSK */
+            out[n++] = (UCHAR)caps; out[n++] = (UCHAR)(caps >> 8);
+            out[1] = (UCHAR)(n - 2);
+            return n;
+        }
+        o += 2 + l;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -271,6 +307,22 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         ULONG auth = p.ConnectParameters.AuthenticationAlgorithms.ElementCount
                    ? (ULONG)p.ConnectParameters.AuthenticationAlgorithms.pElements[0] : 0;
         WLog(Device, L"Log_Wifi_ConnAuth", auth);
+        WLog(Device, L"Log_Wifi_ConnExtLen", extLen);
+        ctx->ConnAuth = auth;
+        ctx->ConnSecure = FALSE;
+        if (auth == 6 || auth == 7) {                    /* RSNA / RSNA_PSK: the IHV builds the RSN IE */
+            BOOLEAN have = FALSE;
+            for (ULONG o = 0; o + 2 <= extLen; o += 2 + ext[o + 1]) if (ext[o] == 48) have = TRUE;
+            UCHAR rsn[40];
+            ULONG rl = have ? 0 : BuildRsnIe(body, bl, auth, rsn, sizeof(rsn));
+            WLog(Device, L"Log_Wifi_RsnLen", rl);
+            if (rl && extLen + rl <= sizeof(ext)) {
+                RtlMoveMemory(ext + rl, ext, extLen);
+                RtlCopyMemory(ext, rsn, rl);
+                extLen += rl;
+            }
+            ctx->ConnSecure = (rl != 0 || have);
+        }
         WLog(Device, L"Log_Wifi_ConnCh", ch);
         WLog(Device, L"Log_Wifi_ConnSsidLen", ssidLen);
         CleanupParsedWdiTaskConnectToIhv(&p);
@@ -294,6 +346,64 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         ctx->DiscHdr = hdr;
         InterlockedExchange(&ctx->DiscPending, 1);
         Rtl_WifiDisconnect(Device);                       /* M4 comes from WifiCx_OnDisconnectDone */
+        return;
+
+
+    case WDI_SET_ADD_CIPHER_KEYS: {
+        WDI_SET_ADD_CIPHER_KEYS_PARAMETERS p = {};
+        NTSTATUS st = Ndis2Nt(ParseWdiSetAddCipherKeysToIhv(inLen - sizeof(WDI_MESSAGE_HEADER),
+                                buf + sizeof(WDI_MESSAGE_HEADER), &ctx->Tlv, &p));
+        if (!NT_SUCCESS(st)) {
+            CleanupParsedWdiSetAddCipherKeysToIhv(&p);
+            WLog(Device, L"Log_Wifi_KeyParseFail", (ULONG)st);
+            WifiRequestComplete(Request, st, sizeof(WDI_MESSAGE_HEADER));
+            return;
+        }
+        for (ULONG i = 0; i < p.SetCipherKey.ElementCount; i++) {
+            const WDI_SET_ADD_CIPHER_KEYS_CONTAINER& k = p.SetCipherKey.pElements[i];
+            ULONG alg = (ULONG)k.CipherKeyTypeInfo.CipherAlgorithm, kt = (ULONG)k.CipherKeyTypeInfo.KeyType;
+            ULONG kid = k.Optional.CipherKeyID_IsPresent ? (ULONG)k.CipherKeyID.CipherKeyID : 0;
+            ULONG klen = k.Optional.CCMPKey_IsPresent ? k.CCMPKey.ElementCount : 0;
+            BOOLEAN group = (kt == (ULONG)WDI_CIPHER_KEY_TYPE_GROUP_KEY);
+            WLog(Device, L"Log_Key_Alg", alg);
+            WLog(Device, L"Log_Key_Type", kt);
+            WLog(Device, L"Log_Key_Id", kid);
+            WLog(Device, L"Log_Key_Len", klen);
+            WLog(Device, L"Log_Key_Dir", (ULONG)k.CipherKeyTypeInfo.Direction);
+            if (alg == (ULONG)WDI_CIPHER_ALGO_CCMP && klen == 16 &&
+                (kt == (ULONG)WDI_CIPHER_KEY_TYPE_GROUP_KEY || kt == (ULONG)WDI_CIPHER_KEY_TYPE_PAIRWISE_KEY)) {
+                const UCHAR* mac = k.Optional.PeerMacAddress_IsPresent ? k.PeerMacAddress.Address : nullptr;
+                NTSTATUS ks = Rtl_WifiKey(Device, 1, group, (UCHAR)kid, group ? nullptr : mac, k.CCMPKey.pElements);
+                WLog(Device, L"Log_Key_Queue", (ULONG)ks);
+            } else {
+                WLog(Device, L"Log_Key_Unsupported", alg);
+            }
+        }
+        CleanupParsedWdiSetAddCipherKeysToIhv(&p);
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
+        return;
+    }
+
+    case WDI_SET_DELETE_CIPHER_KEYS: {
+        WDI_SET_DELETE_CIPHER_KEYS_PARAMETERS p = {};
+        NTSTATUS st = Ndis2Nt(ParseWdiSetDeleteCipherKeysToIhv(inLen - sizeof(WDI_MESSAGE_HEADER),
+                                buf + sizeof(WDI_MESSAGE_HEADER), &ctx->Tlv, &p));
+        if (NT_SUCCESS(st)) {
+            for (ULONG i = 0; i < p.CipherKeyInfo.ElementCount; i++) {
+                const WDI_SET_DELETE_CIPHER_KEYS_CONTAINER& k = p.CipherKeyInfo.pElements[i];
+                BOOLEAN group = ((ULONG)k.CipherKeyTypeInfo.KeyType == (ULONG)WDI_CIPHER_KEY_TYPE_GROUP_KEY);
+                ULONG kid = k.Optional.CipherKeyID_IsPresent ? (ULONG)k.CipherKeyID.CipherKeyID : 0;
+                (VOID)Rtl_WifiKey(Device, 2, group, (UCHAR)kid, nullptr, nullptr);
+            }
+        }
+        CleanupParsedWdiSetDeleteCipherKeysToIhv(&p);
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
+        return;
+    }
+
+    case WDI_SET_DEFAULT_KEY_ID:
+    case WDI_SET_PRIVACY_EXEMPTION_LIST:
+        WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));
         return;
 
     default:
@@ -372,11 +482,19 @@ extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT
             r.AssociationResultParameters.AssociationStatus = (WDI_ASSOC_STATUS)0;      /* success */
             r.AssociationResultParameters.StatusCode = 0;
             r.AssociationResultParameters.ReAssociation = FALSE;
-            r.AssociationResultParameters.AuthAlgorithm = (WDI_AUTH_ALGORITHM)1;        /* 802.11 open */
-            r.AssociationResultParameters.UnicastCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
-            r.AssociationResultParameters.MulticastDataCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
-            r.AssociationResultParameters.MulticastMgmtCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
-            r.AssociationResultParameters.PortAuthorized = TRUE;
+            if (ctx->ConnSecure) {
+                r.AssociationResultParameters.AuthAlgorithm = (WDI_AUTH_ALGORITHM)ctx->ConnAuth;
+                r.AssociationResultParameters.UnicastCipherAlgorithm = (WDI_CIPHER_ALGORITHM)WDI_CIPHER_ALGO_CCMP;
+                r.AssociationResultParameters.MulticastDataCipherAlgorithm = (WDI_CIPHER_ALGORITHM)WDI_CIPHER_ALGO_CCMP;
+                r.AssociationResultParameters.MulticastMgmtCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+                r.AssociationResultParameters.PortAuthorized = FALSE;      /* Windows runs the 4-way handshake */
+            } else {
+                r.AssociationResultParameters.AuthAlgorithm = (WDI_AUTH_ALGORITHM)1;        /* 802.11 open */
+                r.AssociationResultParameters.UnicastCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+                r.AssociationResultParameters.MulticastDataCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+                r.AssociationResultParameters.MulticastMgmtCipherAlgorithm = (WDI_CIPHER_ALGORITHM)0;
+                r.AssociationResultParameters.PortAuthorized = TRUE;
+            }
             r.AssociationResultParameters.BandID = WDI_BAND_ID_2400;
             if (AssocReqLen) {
                 r.Optional.AssociationRequestFrame_IsPresent = 1;

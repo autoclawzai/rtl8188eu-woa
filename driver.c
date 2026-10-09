@@ -33,6 +33,7 @@
 #include "fwdata.h"
 #include "inittab.h"
 #include "inittab2.h"
+#include "testframe.h"
 
 #define TAG "rtl8188eu: "
 #define LOG(fmt, ...) \
@@ -179,7 +180,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
-    ULONG           RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
+    ULONG           RxDataAny, RxH[48], RxU[48], RxType2, RxFlt[6], RxFirstFc, RxFirstV0, RxFirstV3, RxHdrDbg;
     ULONG           DataTxOk, DataTxFail, DataTxDrop, DataRx, DataRxDrop, JoinRuns;
     BSS_ENTRY       Bss[RTL_MAX_BSS];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -1284,6 +1285,54 @@ static VOID Join_StopScan(PDEVICE_CONTEXT c)
     InterlockedExchange(&c->ScanRunning, 0);
 }
 
+
+/* ---- self test: replay the DHCP DISCOVER captured from Linux with the exact Linux descriptor ---- */
+static NTSTATUS Tx_TestFrame(PDEVICE_CONTEXT c, ULONG w4, ULONG w5, ULONG w2)
+{
+    ULONG w[8], i, fl = (ULONG)sizeof(g_TestFrame), seq;
+    USHORT ck = 0;
+    PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
+    WDF_MEMORY_DESCRIPTOR md;
+    WDF_REQUEST_SEND_OPTIONS opts;
+    ULONG_PTR written = 0;
+    NTSTATUS st;
+    WDFUSBPIPE pipe = c->TxPipeData ? c->TxPipeData : c->TxPipe;
+    if (!pipe) return STATUS_DEVICE_NOT_READY;
+    WdfWaitLockAcquire(c->TxLock, NULL);
+    seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
+    RtlCopyMemory(f, g_TestFrame, fl);
+    RtlCopyMemory(f + 4, c->JoinBssid, 6);
+    RtlCopyMemory(f + 10, c->Mac, 6);
+    f[22] = (UCHAR)((seq << 4) & 0xFF); f[23] = (UCHAR)((seq << 4) >> 8);
+    w[0] = 0x8D200000u | fl;  w[1] = 0;  w[2] = w2;  w[3] = seq << 16;
+    w[4] = w4;  w[5] = w5;  w[6] = 0;  w[7] = 0x20000000u;
+    for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
+    w[7] |= ck;
+    RtlCopyMemory(b, w, TXDESC_LEN);
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, TXDESC_LEN + fl);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
+    st = WdfUsbTargetPipeWriteSynchronously(pipe, WDF_NO_HANDLE, &opts, &md, (PULONG)&written);
+    WdfWaitLockRelease(c->TxLock);
+    return st;
+}
+
+static VOID Join_SelfTest(WDFDEVICE dev, PDEVICE_CONTEXT c)
+{
+    ULONG before, k;
+    if (!RegGetUlong(dev, L"Cfg_SelfTest", 1)) return;
+    SleepMs(300);
+    before = c->RxDataAny;
+    for (k = 0; k < 3; k++) { (VOID)Tx_TestFrame(c, 0x0102B148u, 0x0001FF13u, 0x03410000u); SleepMs(150); }
+    RegLog(dev, L"Log_Test_A_LinuxDesc_RxData", c->RxDataAny - before);
+    before = c->RxDataAny;
+    for (k = 0; k < 3; k++) { (VOID)Tx_TestFrame(c, 0x00000148u, 0x0001FF03u, 0x03010000u); SleepMs(150); }
+    RegLog(dev, L"Log_Test_B_OurDesc11M_RxData", c->RxDataAny - before);
+    before = c->RxDataAny;
+    for (k = 0; k < 3; k++) { (VOID)Tx_TestFrame(c, 0x0102B148u, 0x0001FF04u, 0x03410000u); SleepMs(150); }
+    RegLog(dev, L"Log_Test_C_LinuxDesc6M_RxData", c->RxDataAny - before);
+}
+
 static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
 {
     NTSTATUS st;
@@ -1332,6 +1381,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     if (!NT_SUCCESS(st)) return st;
     InterlockedExchange(&c->JoinState, JOIN_UP);
     WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
+    Join_SelfTest(dev, c);
     return STATUS_SUCCESS;
 }
 
@@ -1391,11 +1441,12 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Rx_FltLlc", c->RxFlt[5]);
     RegLog(dev, L"Log_Rx_FirstFc", c->RxFirstFc);
     RegLog(dev, L"Log_Rx_FirstV0", c->RxFirstV0);
+    RegLog(dev, L"Log_Rx_DataAny", c->RxDataAny);
     for (i = 0; i < 48; i++) {
         WCHAR n1[] = L"Log_RxH_T0S00", n2[] = L"Log_RxU_T0S00";
-        n1[10] = n2[10] = (WCHAR)(L'0' + i / 16);
-        n1[12] = n2[12] = (WCHAR)(L'0' + (i % 16) / 10);
-        n1[13] = n2[13] = (WCHAR)(L'0' + (i % 16) % 10);
+        n1[9] = n2[9] = (WCHAR)(L'0' + i / 16);
+        n1[11] = n2[11] = (WCHAR)(L'0' + (i % 16) / 10);
+        n1[12] = n2[12] = (WCHAR)(L'0' + (i % 16) % 10);
         if (c->RxH[i]) RegLog(dev, n1, c->RxH[i]);
         if (c->RxU[i]) RegLog(dev, n2, c->RxU[i]);
     }
@@ -1474,6 +1525,7 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
     if (type < 3) {
         c->RxH[type * 16 + sub]++;
         if (len >= 10 && RtlEqualMemory(f + 4, c->Mac, 6)) c->RxU[type * 16 + sub]++;
+        if (type == 2 && !(sub & 4)) c->RxDataAny++;
     }
     if (len < 24) return;
 

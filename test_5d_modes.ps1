@@ -31,6 +31,6 @@ foreach ($m in 0,1,2,3,4,5,6,7) {
   if ($ip -and $ip -notmatch '^169\.254') { "   >>> DHCP chal gaya in mode $m" | Out-File $out -Append; break }
 }
 "--- final counters ---" | Out-File $out -Append
-(Get-ItemProperty $key).PSObject.Properties | Where-Object { $_.Name -match '^Log_(Data|Dp|Rx_(Type2|Flt|First)|TxMode)' } | Sort-Object Name |
+(Get-ItemProperty $key).PSObject.Properties | Where-Object { $_.Name -match '^Log_(Join|Data|Dp|Rx_(Type2|Flt|First)|TxMode)' } | Sort-Object Name |
   ForEach-Object { "{0} = {1}" -f $_.Name, $_.Value } | Out-File $out -Append
 "Done -> $out"

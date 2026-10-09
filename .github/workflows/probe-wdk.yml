@@ -21,22 +21,25 @@ jobs:
                 $text = $text.Substring($n); $i++
               }
             }
-            $files = Get-ChildItem $root -Include *.h,*.hpp -Recurse
-            $names = @('WDI_SET_ADD_CIPHER_KEYS_PARAMETERS','WDI_SET_DELETE_CIPHER_KEYS_PARAMETERS','WDI_SET_DEFAULT_KEY_ID_PARAMETERS','WDI_TASK_DISCONNECT_PARAMETERS','WDI_SET_ADD_CIPHER_KEYS_CONTAINER','WDI_CIPHER_KEY_TYPE_INFO_CONTAINER','WDI_CIPHER_CCMP_KEY','WDI_CONNECT_PARAMETERS_CONTAINER','WDI_CIPHER_KEY_DIRECTION','WDI_CIPHER_KEY_TYPE')
+            $f = Join-Path $root 'TlvGenerated_.hpp'
+            $lines = Get-Content $f
+            $names = @('WDI_SET_ADD_CIPHER_KEYS_CONTAINER','WDI_SET_DELETE_CIPHER_KEYS_CONTAINER','WDI_SET_DEFAULT_KEY_ID_CONTAINER','WDI_DISCONNECT_PARAMETERS_CONTAINER','WDI_CIPHER_KEY_CCMP_INFO_CONTAINER','WDI_CIPHER_KEY_TYPE_STRUCT','WDI_RECEIVE_SEQUENCE_COUNT_STRUCT','WDI_PRIVATE_BYTE_BLOB','WDI_SET_DEFAULT_KEY_ID_STRUCT','WDI_CIPHER_KEY_TYPE_INFO')
             $out = @()
-            foreach ($f in $files) {
-              $lines = Get-Content $f.FullName
-              for ($i=0; $i -lt $lines.Length; $i++) {
-                foreach ($n in $names) {
-                  if ($lines[$i] -match ('(struct|class|enum|typedef)\s+(_)?' + $n + '\b')) {
-                    $end = [Math]::Min($lines.Length-1, $i+40)
-                    $blk = @()
-                    for ($j=$i; $j -le $end; $j++) { $blk += ($lines[$j] -replace '\s+',' '); if ($lines[$j] -match '^\s*\};?\s*$' -and $j -gt $i+1) { break } }
-                    $out += ('## ' + $f.Name + ':' + $i + ' ' + ($blk -join ' | '))
+            for ($i=0; $i -lt $lines.Length; $i++) {
+              foreach ($n in $names) {
+                if ($lines[$i] -match ('^\s*(typedef\s+)?struct\s+_?' + $n + '\s*$') -or $lines[$i] -match ('^\s*(typedef\s+)?struct\s+_' + $n + '\s*\{?\s*$')) {
+                  $blk = @()
+                  for ($j=$i; $j -lt [Math]::Min($lines.Length, $i+90); $j++) {
+                    $t = ($lines[$j] -replace '\s+',' ').Trim()
+                    if ($t -match 'IsPresent|^#|WDI_TLV|namespace|MarkArray|^\{|^\};?$' -and $t -notmatch '^\} ') { continue }
+                    $blk += $t
+                    if ($t -match '^\} ') { break }
                   }
+                  $out += ('## ' + $i + ' ' + ($blk -join ' '))
                 }
               }
             }
-            $msg = Get-ChildItem $root -Include *.h,*.hpp -Recurse | Select-String -Pattern 'WDI_SET_ADD_CIPHER_KEYS\b|WDI_SET_DELETE_CIPHER_KEYS\b|WDI_SET_DEFAULT_KEY_ID\b|ParseWdiSetAddCipherKeysToIhv|ParseWdiSetDeleteCipherKeysToIhv|ParseWdiSetDefaultKeyIdToIhv|ParseWdiTaskDisconnectToIhv|CleanupParsedWdiSetAddCipherKeys' | Select-Object -First 30 | ForEach-Object { '@@ ' + $_.Filename + ':' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
-            Emit "structs" (($out + $msg) -join "`n")
+            $en = Select-String -Path $f -Pattern 'enum _?WDI_CIPHER_KEY_DIRECTION|enum _?WDI_CIPHER_ALGORITHM|WDI_CIPHER_KEY_TYPE\b.*=|WDI_CIPHER_KEY_DIRECTION_|WDI_CIPHER_KEY_TYPE_|WDI_CIPHER_ALGORITHM_' | Select-Object -First 40 | ForEach-Object { '@@ ' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
+            $ids = Get-ChildItem $root -Include *.h,*.hpp -Recurse | Select-String -Pattern 'WDI_SET_ADD_CIPHER_KEYS\s*=|WDI_SET_DELETE_CIPHER_KEYS\s*=|WDI_SET_DEFAULT_KEY_ID\s*=|define WDI_SET_ADD_CIPHER_KEYS|define WDI_SET_DEFAULT_KEY_ID|WDI_SET_DEFAULT_KEY_ID,' | Select-Object -First 10 | ForEach-Object { '@@ ' + $_.Filename + ':' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
+            Emit "structs" (($out + $en + $ids) -join "`n")
           } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }

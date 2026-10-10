@@ -560,9 +560,22 @@ extern "C" VOID WifiCx_OnDisconnectDone(WDFDEVICE Device)
 extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
 {
     PWIFI_CTX ctx = GetWifiCtx(Device);
+    BOOLEAN was = ctx->Connected;
     ctx->Connected = FALSE;
     WLog(Device, L"Log_Wifi_LinkLost", Reason);
-    /* TODO(5d): unsolicited WDI disconnect indication so Windows leaves the connected state */
+    if (!was) return;
+    /* unsolicited disassociation indication: Windows leaves the connected state and may reconnect */
+    WDI_INDICATION_DISASSOCIATION_PARAMETERS p = {};
+    RtlCopyMemory(p.DisconnectIndicationParameters.MacAddress.Address, ctx->Bssid, 6);
+    p.DisconnectIndicationParameters.DisassociationWABIReason = WDI_ASSOC_STATUS_PEER_DEAUTHENTICATED;
+    UINT8* out = nullptr; ULONG cb = 0;
+    NDIS_STATUS g = GenerateWdiIndicationDisassociation(&p, 0, &ctx->Tlv, &cb, &out);
+    WLog(Device, L"Log_Wifi_DisassocGen", (ULONG)g);
+    if (g == 0) {
+        WDI_MESSAGE_HEADER h = {};
+        SendIndication(Device, h, WDI_INDICATION_DISASSOCIATION, 0, STATUS_SUCCESS, out, cb);
+        FreeGenerated(out);
+    }
 }
 
 /* ------------------------------------------------------------------ */

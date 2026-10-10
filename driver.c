@@ -594,7 +594,7 @@ static LONG Rx_Rssi(const UCHAR *phy, ULONG rate)
         }
         pwr += 6;
     } else {
-        pwr = (LONG)((phy[1] >> 1) & 0x7F) - 110;
+        pwr = (LONG)((phy[4] >> 1) & 0x7F) - 110;           /* rtl8xxxu: (cck_sig_qual_ofdm_pwdb_all >> 1) - 110 */
     }
     if (pwr > -10) pwr = -10;
     if (pwr < -100) pwr = -100;

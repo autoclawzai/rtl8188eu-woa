@@ -70,6 +70,7 @@ typedef struct _WIFI_CTX {
     BOOLEAN     SoftwareRadioOn;
     LONG        CmdCount;
     LONG        LastMsgId;
+    volatile LONG ScanTaskCount;
     volatile LONG ScanPending;      /* a WDI scan task waits for its M4 */
     WDI_MESSAGE_HEADER ScanHdr;     /* header of that task */
     /* phase 5d */
@@ -245,6 +246,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         return;
 
     case WDI_TASK_SCAN: {
+        WLog(Device, L"Log_Wifi_ScanTasks", (ULONG)InterlockedIncrement(&ctx->ScanTaskCount));
         /* 5c: SSID/channel filters are ignored for now, we always scan all 13 channels */
         if (InterlockedCompareExchange(&ctx->ScanPending, 1, 0) != 0) {
             WifiRequestComplete(Request, STATUS_INVALID_DEVICE_STATE, sizeof(WDI_MESSAGE_HEADER));
@@ -292,6 +294,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
             o += 2 + l;
         }
 
+        WLog(Device, L"Log_Wifi_ConnBodyLen", bl);
         ctx->ConnBeaconLen = 0;
         if (body && bl && bl <= sizeof(ctx->ConnBeacon)) {
             RtlCopyMemory(ctx->ConnBeacon, body, bl);
@@ -323,6 +326,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
             }
             ctx->ConnSecure = (rl != 0 || have);
         }
+        WLog(Device, L"Log_Wifi_ConnSecure", (ULONG)ctx->ConnSecure);
         WLog(Device, L"Log_Wifi_ConnCh", ch);
         WLog(Device, L"Log_Wifi_ConnSsidLen", ssidLen);
         CleanupParsedWdiTaskConnectToIhv(&p);

@@ -1693,6 +1693,7 @@ static VOID EvtLossWork(WDFWORKITEM wi)
     if (c->Stopping) return;
     if (c->HwReady) Join_HwDown(c);
     WifiCx_OnLinkLost(dev, c->LossReason);
+    if (c->HwReady && !c->Stopping) ScanStart(c);          /* refresh the BSS list so Windows can see the AP again */
 }
 
 /* ---- data TX queue (PASSIVE worker drains frames queued at DISPATCH) ---- */

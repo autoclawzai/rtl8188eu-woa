@@ -91,7 +91,7 @@
 #define SCAN_DIRECTED_MS    100
 #define TXQ_N               32
 #define TXQ_BUF             1600
-#define TXD_RATE_DATA       8         /* OFDM 24M default (3 = 11M CCK, 11 = 54M), fixed until TX rate control */
+#define TXD_RATE_DATA       0         /* 0 = automatic (RSSI based), else fixed descriptor rate id (3 = 11M CCK, 11 = 54M, 12+ = MCS0..) */
 #define JOIN_IDLE           0
 #define JOIN_AUTH           1
 #define JOIN_ASSOC          2
@@ -194,6 +194,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxQ[TXQ_N][TXQ_BUF];
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
+    volatile LONG   RssiAvg;                /* smoothed RSSI (dBm) of frames from the AP, 0 = unknown */
     volatile LONG   TxRate;                 /* Cfg_TxRate: descriptor rate id (3=11M CCK, 11=54M OFDM, 12+=MCS0..) */
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
     ULONG           RxNativeMode, TxNative, RxNative, TxAll, TxCls[5], TxFirstMs, TxLastMs, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[10], DbgRxLen[12]; ULONG DbgRxMs[12], DbgTxMs[10];
@@ -1128,6 +1129,18 @@ ULONG Rtl_SnapshotBss(WDFDEVICE dev, BSS_ENTRY *out, ULONG max)
 
 static USHORT Le16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
 
+/* TX rate: fixed when Cfg_TxRate != 0, otherwise chosen from the smoothed RSSI of the AP's frames. */
+static ULONG Tx_PickRate(PDEVICE_CONTEXT c)
+{
+    LONG r = c->RssiAvg;
+    if (c->TxRate) return (ULONG)c->TxRate & 0x7F;
+    if (r == 0) return 8;                       /* unknown yet: 24M OFDM */
+    if (r >= -62) return 19;                    /* MCS7 */
+    if (r >= -70) return 16;                    /* MCS4 */
+    if (r >= -78) return 8;                     /* 24M OFDM */
+    return 3;                                   /* 11M CCK */
+}
+
 /* Generic TX through the descriptor. mgmt -> ep 0x02 / queue MGNT, data -> second endpoint / queue BE.
  * Called at PASSIVE_LEVEL only. frame = full 802.11 frame (seq ctrl is patched here). */
 static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN mgmt, BOOLEAN bmc)
@@ -1138,7 +1151,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     UCHAR i;
     PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
     LONG mode = mgmt ? 0 : c->TxMode;
-    ULONG queue = 0, rate = (ULONG)c->TxRate & 0x7F;
+    ULONG queue = 0, rate = Tx_PickRate(c);
     BOOLEAN useMgmtPipe = FALSE, qos = (BOOLEAN)(frame[0] == 0x88), enc = FALSE;
     WDFUSBPIPE pipe;
     WDF_MEMORY_DESCRIPTOR md;
@@ -1656,6 +1669,8 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     RegLog(dev, L"Log_TxMode_Active", (ULONG)c->TxMode);
     RegLog(dev, L"Log_TxRate_Active", (ULONG)c->TxRate);
+    RegLog(dev, L"Log_Rate_Rssi", (ULONG)(-c->RssiAvg));
+    RegLog(dev, L"Log_Rate_Picked", Tx_PickRate(c));
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }
@@ -1810,8 +1825,15 @@ static VOID Rx_Dispatch(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len)
         ULONG shift = (v0 >> 24) & 3;
         ULONG hdr = RX_DESC_LEN + drvInfo + shift;
         if (pktLen == 0 || off + hdr + pktLen > len) break;
-        if (!(v0 & 0xC000) && ((v3 >> 14) & 3) == 0)        /* no CRC/ICV error, not a C2H report */
-            Rx_Frame(c, buf + off + hdr, pktLen, v0);
+        if (!(v0 & 0xC000) && ((v3 >> 14) & 3) == 0) {      /* no CRC/ICV error, not a C2H report */
+            const UCHAR *fr = buf + off + hdr;
+            if (drvInfo >= 2 && (v0 & (1u << 26)) && pktLen >= 16 && c->JoinState == JOIN_UP &&
+                RtlEqualMemory(fr + 10, c->JoinBssid, 6)) {      /* PHY status present, frame from our AP */
+                LONG rs = Rx_Rssi(buf + off + RX_DESC_LEN, v3 & 0x3F), old = c->RssiAvg;
+                c->RssiAvg = old ? (old * 7 + rs) / 8 : rs;
+            }
+            Rx_Frame(c, fr, pktLen, v0);
+        }
         off += (hdr + pktLen + 127) & ~127u;
     }
 }
@@ -1829,6 +1851,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     RtlZeroMemory(c->JoinSsid, sizeof(c->JoinSsid));
     RtlCopyMemory(c->JoinSsid, ssid, ssidLen);
     c->JoinSsidLen = (UCHAR)ssidLen;
+    c->RssiAvg = 0;
     c->JoinCh = ch;
     c->JoinExtIeLen = extIeLen;
     if (extIeLen) RtlCopyMemory(c->JoinExtIe, extIe, extIeLen);

@@ -10,36 +10,23 @@ jobs:
       - name: Probe
         shell: pwsh
         run: |
-          try {
-            $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0"
-            function Emit([string]$title, [string]$text) {
-              $text = $text.Replace('%','%25').Replace("`r",'').Replace("`n",'%0A')
-              $i = 0
-              while ($text.Length -gt 0 -and $i -lt 12) {
-                $n = [Math]::Min(3600, $text.Length)
-                Write-Host ("::notice title=" + $title + "#" + $i + "::" + $text.Substring(0,$n))
-                $text = $text.Substring($n); $i++
-              }
+          $root = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.26100.0\km\wlan\2.0"
+          $out = @()
+          foreach ($f in (Get-ChildItem $root -Include *.h,*.hpp -Recurse)) {
+            $m = Select-String -Path $f.FullName -Pattern 'GenerateWdiIndicationDisconnect|WDI_INDICATION_DISCONNECT\b|WDI_INDICATION_DISCONNECT_PARAMETERS|WDI_DISCONNECT_PARAMETERS_CONTAINER|WDI_INDICATION_ROAMING_NEEDED|WDI_DISCONNECT_REASON|WDI_ASSOC_STATUS_' | Select-Object -First 25
+            foreach ($x in $m) { $out += ('@@ ' + $f.Name + ':' + $x.LineNumber + ' ' + ($x.Line -replace '\s+',' ')) }
+          }
+          $tf = Join-Path $root 'TlvGenerated_.hpp'
+          $lines = Get-Content $tf
+          for ($i=0; $i -lt $lines.Length; $i++) {
+            if ($lines[$i] -match 'struct _WDI_DISCONNECT_PARAMETERS_CONTAINER|struct _WDI_INDICATION_DISCONNECT_PARAMETERS') {
+              $out += ('## ' + $i + ' ' + (($lines[$i..($i+25)] | ForEach-Object { ($_ -replace '\s+',' ').Trim() }) -join ' '))
             }
-            $f = Join-Path $root 'TlvGenerated_.hpp'
-            $lines = Get-Content $f
-            $names = @('WDI_SET_ADD_CIPHER_KEYS_CONTAINER','WDI_SET_DELETE_CIPHER_KEYS_CONTAINER','WDI_SET_DEFAULT_KEY_ID_CONTAINER','WDI_DISCONNECT_PARAMETERS_CONTAINER','WDI_CIPHER_KEY_CCMP_INFO_CONTAINER','WDI_CIPHER_KEY_TYPE_STRUCT','WDI_RECEIVE_SEQUENCE_COUNT_STRUCT','WDI_PRIVATE_BYTE_BLOB','WDI_SET_DEFAULT_KEY_ID_STRUCT','WDI_CIPHER_KEY_TYPE_INFO')
-            $out = @()
-            for ($i=0; $i -lt $lines.Length; $i++) {
-              foreach ($n in $names) {
-                if ($lines[$i] -match ('^\s*(typedef\s+)?struct\s+_?' + $n + '\s*$') -or $lines[$i] -match ('^\s*(typedef\s+)?struct\s+_' + $n + '\s*\{?\s*$')) {
-                  $blk = @()
-                  for ($j=$i; $j -lt [Math]::Min($lines.Length, $i+90); $j++) {
-                    $t = ($lines[$j] -replace '\s+',' ').Trim()
-                    if ($t -match 'IsPresent|^#|WDI_TLV|namespace|MarkArray|^\{|^\};?$' -and $t -notmatch '^\} ') { continue }
-                    $blk += $t
-                    if ($t -match '^\} ') { break }
-                  }
-                  $out += ('## ' + $i + ' ' + ($blk -join ' '))
-                }
-              }
-            }
-            $en = Select-String -Path $f -Pattern 'enum _?WDI_CIPHER_KEY_DIRECTION|enum _?WDI_CIPHER_ALGORITHM|WDI_CIPHER_KEY_TYPE\b.*=|WDI_CIPHER_KEY_DIRECTION_|WDI_CIPHER_KEY_TYPE_|WDI_CIPHER_ALGORITHM_' | Select-Object -First 40 | ForEach-Object { '@@ ' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
-            $ids = Get-ChildItem $root -Include *.h,*.hpp -Recurse | Select-String -Pattern 'WDI_SET_ADD_CIPHER_KEYS\s*=|WDI_SET_DELETE_CIPHER_KEYS\s*=|WDI_SET_DEFAULT_KEY_ID\s*=|define WDI_SET_ADD_CIPHER_KEYS|define WDI_SET_DEFAULT_KEY_ID|WDI_SET_DEFAULT_KEY_ID,' | Select-Object -First 10 | ForEach-Object { '@@ ' + $_.Filename + ':' + $_.LineNumber + ' ' + ($_.Line -replace '\s+',' ') }
-            Emit "structs" (($out + $en + $ids) -join "`n")
-          } catch { Write-Host ("::error title=probe::" + ($_ | Out-String).Replace("`n",' ')); exit 1 }
+          }
+          $text = ($out -join "`n").Replace('%','%25').Replace("`n",'%0A')
+          $i = 0
+          while ($text.Length -gt 0 -and $i -lt 8) {
+            $n = [Math]::Min(3600, $text.Length)
+            Write-Host ("::notice title=probe#" + $i + "::" + $text.Substring(0,$n))
+            $text = $text.Substring($n); $i++
+          }

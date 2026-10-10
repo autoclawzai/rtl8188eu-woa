@@ -194,6 +194,8 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxQ[TXQ_N][TXQ_BUF];
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
+    volatile LONG   RssiCck, RssiOfdm;      /* smoothed RSSI (dBm) per frame class from the AP, 0 = no sample yet */
+    ULONG           RssiNCck, RssiNOfdm, PickN[4];
     volatile LONG   RssiAvg;                /* smoothed RSSI (dBm) of frames from the AP, 0 = unknown */
     volatile LONG   TxRate;                 /* Cfg_TxRate: descriptor rate id (3=11M CCK, 11=54M OFDM, 12+=MCS0..) */
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
@@ -1132,13 +1134,16 @@ static USHORT Le16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
 /* TX rate: fixed when Cfg_TxRate != 0, otherwise chosen from the smoothed RSSI of the AP's frames. */
 static ULONG Tx_PickRate(PDEVICE_CONTEXT c)
 {
-    LONG r = c->RssiAvg;
+    LONG r = c->RssiOfdm;                       /* OFDM/HT frames only: CCK RSSI uses a different (AGC) formula */
+    ULONG pick;
     if (c->TxRate) return (ULONG)c->TxRate & 0x7F;
-    if (r == 0) return 8;                       /* unknown yet: 24M OFDM */
-    if (r >= -62) return 19;                    /* MCS7 */
-    if (r >= -70) return 16;                    /* MCS4 */
-    if (r >= -78) return 8;                     /* 24M OFDM */
-    return 3;                                   /* 11M CCK */
+    if (r == 0) pick = 8;                       /* no sample yet: 24M OFDM */
+    else if (r >= -62) pick = 19;               /* MCS7 */
+    else if (r >= -70) pick = 16;               /* MCS4 */
+    else if (r >= -78) pick = 8;                /* 24M OFDM */
+    else pick = 3;                              /* 11M CCK */
+    c->PickN[pick == 19 ? 0 : pick == 16 ? 1 : pick == 8 ? 2 : 3]++;
+    return pick;
 }
 
 /* Generic TX through the descriptor. mgmt -> ep 0x02 / queue MGNT, data -> second endpoint / queue BE.
@@ -1669,8 +1674,14 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     RegLog(dev, L"Log_TxMode_Active", (ULONG)c->TxMode);
     RegLog(dev, L"Log_TxRate_Active", (ULONG)c->TxRate);
-    RegLog(dev, L"Log_Rate_Rssi", (ULONG)(-c->RssiAvg));
-    RegLog(dev, L"Log_Rate_Picked", Tx_PickRate(c));
+    RegLog(dev, L"Log_Rate_RssiOfdm", (ULONG)(-c->RssiOfdm));
+    RegLog(dev, L"Log_Rate_RssiCck", (ULONG)(-c->RssiCck));
+    RegLog(dev, L"Log_Rate_NOfdm", c->RssiNOfdm);
+    RegLog(dev, L"Log_Rate_NCck", c->RssiNCck);
+    RegLog(dev, L"Log_Rate_PickMcs7", c->PickN[0]);
+    RegLog(dev, L"Log_Rate_PickMcs4", c->PickN[1]);
+    RegLog(dev, L"Log_Rate_Pick24M", c->PickN[2]);
+    RegLog(dev, L"Log_Rate_Pick11M", c->PickN[3]);
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }
@@ -1829,8 +1840,9 @@ static VOID Rx_Dispatch(PDEVICE_CONTEXT c, const UCHAR *buf, ULONG len)
             const UCHAR *fr = buf + off + hdr;
             if (drvInfo >= 2 && (v0 & (1u << 26)) && pktLen >= 16 && c->JoinState == JOIN_UP &&
                 RtlEqualMemory(fr + 10, c->JoinBssid, 6)) {      /* PHY status present, frame from our AP */
-                LONG rs = Rx_Rssi(buf + off + RX_DESC_LEN, v3 & 0x3F), old = c->RssiAvg;
-                c->RssiAvg = old ? (old * 7 + rs) / 8 : rs;
+                LONG rs = Rx_Rssi(buf + off + RX_DESC_LEN, v3 & 0x3F);
+                if ((v3 & 0x3F) <= 3) { LONG o = c->RssiCck;  c->RssiCck  = o ? (o * 7 + rs) / 8 : rs; c->RssiNCck++; }
+                else                  { LONG o = c->RssiOfdm; c->RssiOfdm = o ? (o * 7 + rs) / 8 : rs; c->RssiNOfdm++; }
             }
             Rx_Frame(c, fr, pktLen, v0);
         }
@@ -1851,7 +1863,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     RtlZeroMemory(c->JoinSsid, sizeof(c->JoinSsid));
     RtlCopyMemory(c->JoinSsid, ssid, ssidLen);
     c->JoinSsidLen = (UCHAR)ssidLen;
-    c->RssiAvg = 0;
+    c->RssiCck = c->RssiOfdm = 0; c->RssiNCck = c->RssiNOfdm = 0; RtlZeroMemory(c->PickN, sizeof(c->PickN));
     c->JoinCh = ch;
     c->JoinExtIeLen = extIeLen;
     if (extIeLen) RtlCopyMemory(c->JoinExtIe, extIe, extIeLen);

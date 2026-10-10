@@ -91,6 +91,7 @@
 #define SCAN_DIRECTED_MS    100
 #define TXQ_N               256
 #define TXA_N               8
+#define TXA_BUF             12288
 #define TXQ_BUF             1600
 #define TXD_RATE_DATA       0         /* 0 = automatic (RSSI based), else fixed descriptor rate id (3 = 11M CCK, 11 = 54M, 12+ = MCS0..) */
 #define JOIN_IDLE           0
@@ -172,6 +173,7 @@ typedef struct _DEVICE_CONTEXT {
     WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork, KeyWork, BaWork;
     BA_REQ          BaQ[BAQ_N];
     TXSLOT          TxSlot[TXA_N];
+    ULONG           TxAggNum, TxAggPos, TxAggBatches, TxAggFrames;
     KSEMAPHORE      TxSem;
     BOOLEAN         TxAsyncOk;
     volatile LONG   TxAsyncFail, TxAsyncSub;
@@ -1184,10 +1186,13 @@ static VOID TxAsync_Init(WDFDEVICE dev, PDEVICE_CONTEXT c)
         WDF_OBJECT_ATTRIBUTES_INIT(&a); a.ParentObject = dev;
         if (!NT_SUCCESS(WdfRequestCreate(&a, WdfUsbTargetPipeGetIoTarget(pipe), &c->TxSlot[k].Req))) { c->TxSlot[0].Req = NULL; return; }
         WDF_OBJECT_ATTRIBUTES_INIT(&a); a.ParentObject = dev;
-        if (!NT_SUCCESS(WdfMemoryCreate(&a, NonPagedPoolNx, 'xTxR', TXDESC_LEN + TXQ_BUF + 16, &c->TxSlot[k].Mem, &buf))) { c->TxSlot[0].Req = NULL; return; }
+        if (!NT_SUCCESS(WdfMemoryCreate(&a, NonPagedPoolNx, 'xTxR', TXA_BUF, &c->TxSlot[k].Mem, &buf))) { c->TxSlot[0].Req = NULL; return; }
         c->TxSlot[k].Buf = (PUCHAR)buf;
     }
     c->TxAsyncOk = (RegGetUlong(dev, L"Cfg_TxAsync", 1) != 0);
+    c->TxAggNum = RegGetUlong(dev, L"Cfg_TxAgg", 0);          /* 0/1 = off, 2..6 = max frames per bulk transfer */
+    if (c->TxAggNum > 6) c->TxAggNum = 6;
+    c->TxAggPos = RegGetUlong(dev, L"Cfg_TxAggPos", 2);
 }
 
 /* Wait until all in-flight async writes completed (cancel stragglers). */
@@ -1319,6 +1324,114 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     WdfWaitLockRelease(c->TxLock);
     if (mgmt) { if (NT_SUCCESS(st)) c->TxOk++; else c->TxFail++; }
     else { if (NT_SUCCESS(st)) c->DataTxOk++; else c->DataTxFail++; }
+    return st;
+}
+
+/* USB TX aggregation (the Realtek driver does this: UsbTxAggMode=1, UsbTxAggDescNum=6): several
+ * [32 byte descriptor + frame] units, each padded to 8 bytes, go out in ONE bulk transfer; the count is
+ * written into the first descriptor. Which descriptor byte holds the count is selectable (Cfg_TxAggPos)
+ * because it is not verified yet: 0 = dword5[31:24], 1 = dword6[31:24], 2 = dword7[31:24]. */
+static ULONG Tx_BuildData(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, PUCHAR b)
+{
+    ULONG w[8], seq, hl = (frame[0] & 0x80) ? 26 : 24, rate = Tx_PickRate(c), n = fl;
+    USHORT ck = 0;
+    UCHAR i;
+    PUCHAR f = b + TXDESC_LEN;
+    BOOLEAN enc = FALSE, qos = (BOOLEAN)(frame[0] == 0x88);
+    if (fl < 24 || fl > TXQ_BUF) return 0;
+    seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
+    if (c->PtkInstalled && (frame[0] & 0x0C) == 0x08 && fl > hl + 8 && fl + 8 <= TXQ_BUF &&
+        !(frame[hl + 6] == 0x88 && frame[hl + 7] == 0x8E)) {
+        ULONG64 pn = c->TxPn++;
+        RtlCopyMemory(f, frame, hl);
+        f[1] |= 0x40;
+        f[hl + 0] = (UCHAR)pn;         f[hl + 1] = (UCHAR)(pn >> 8);
+        f[hl + 2] = 0;                 f[hl + 3] = 0x20;
+        f[hl + 4] = (UCHAR)(pn >> 16); f[hl + 5] = (UCHAR)(pn >> 24);
+        f[hl + 6] = (UCHAR)(pn >> 32); f[hl + 7] = (UCHAR)(pn >> 40);
+        RtlCopyMemory(f + hl + 8, frame + hl, fl - hl);
+        n += 8; enc = TRUE; c->TxEnc++;
+    } else {
+        RtlCopyMemory(f, frame, fl);
+    }
+    f[22] = (UCHAR)((seq << 4) & 0xFF);
+    f[23] = (UCHAR)((seq << 4) >> 8);
+    w[0] = 0x8C200000u | n;
+    w[1] = enc ? 0x00C00000u : 0;
+    w[2] = 0x03010000u;
+    w[3] = seq << 16;
+    w[4] = 0x00000100u | (qos ? 0x40u : 0u);
+    w[5] = 0x0001FF00u | rate;
+    w[6] = 0;
+    w[7] = 0x20000000u;
+    for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
+    w[7] |= ck;
+    RtlCopyMemory(b, w, TXDESC_LEN);
+    return TXDESC_LEN + n;
+}
+
+/* Send frames[0..cnt) as one aggregated bulk transfer (async slot). Called at PASSIVE_LEVEL. */
+static NTSTATUS Tx_SendBatch(PDEVICE_CONTEXT c, const UCHAR **fr, const ULONG *fl, ULONG cnt)
+{
+    LARGE_INTEGER to;
+    TXSLOT *slot = NULL;
+    ULONG k, pos = 0, i, firstLen = 0, w[8];
+    USHORT ck = 0;
+    UCHAR j;
+    WDFUSBPIPE pipe = c->TxPipeData ? c->TxPipeData : c->TxPipe;
+    WDF_REQUEST_REUSE_PARAMS rp;
+    WDFMEMORY_OFFSET off;
+    WDF_REQUEST_SEND_OPTIONS opts;
+    NTSTATUS st;
+
+    to.QuadPart = -5000000;
+    if (KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &to) != STATUS_SUCCESS) return STATUS_IO_TIMEOUT;
+    for (k = 0; k < TXA_N; k++)
+        if (InterlockedCompareExchange(&c->TxSlot[k].InUse, 1, 0) == 0) { slot = &c->TxSlot[k]; break; }
+    if (!slot) { KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE); return STATUS_DEVICE_BUSY; }
+
+    for (i = 0; i < cnt; i++) {
+        ULONG n = Tx_BuildData(c, fr[i], fl[i], slot->Buf + pos);
+        if (!n) { pos = 0; break; }
+        if (i == 0) firstLen = n;
+        pos += (n + 7) & ~7u;
+    }
+    if (!pos) {
+        InterlockedExchange(&slot->InUse, 0);
+        KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (cnt > 1) {                                          /* count goes into the FIRST descriptor, checksum redone */
+        RtlCopyMemory(w, slot->Buf, TXDESC_LEN);
+        w[7] &= 0xFFFF0000u;
+        if (c->TxAggPos == 0) w[5] |= cnt << 24;
+        else if (c->TxAggPos == 1) w[6] |= cnt << 24;
+        else w[7] |= cnt << 24;
+        w[7] &= 0xFFFF0000u;
+        for (j = 0; j < 8; j++) ck ^= (USHORT)(w[j] & 0xFFFF) ^ (USHORT)(w[j] >> 16);
+        w[7] |= ck;
+        RtlCopyMemory(slot->Buf, w, TXDESC_LEN);
+    }
+    (VOID)firstLen;
+    InterlockedIncrement(&c->TxAsyncSub);
+    c->TxAggBatches++; c->TxAggFrames += cnt;
+    WDF_REQUEST_REUSE_PARAMS_INIT(&rp, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+    st = WdfRequestReuse(slot->Req, &rp);
+    if (NT_SUCCESS(st)) {
+        off.BufferOffset = 0; off.BufferLength = pos;
+        st = WdfUsbTargetPipeFormatRequestForWrite(pipe, slot->Req, slot->Mem, &off);
+    }
+    if (NT_SUCCESS(st)) {
+        WdfRequestSetCompletionRoutine(slot->Req, EvtTxDone, slot);
+        WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+        WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
+        if (WdfRequestSend(slot->Req, WdfUsbTargetPipeGetIoTarget(pipe), &opts)) return STATUS_SUCCESS;
+        st = WdfRequestGetStatus(slot->Req);
+    }
+    c->DataTxFail++;
+    InterlockedIncrement(&c->TxAsyncFail);
+    InterlockedExchange(&slot->InUse, 0);
+    KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
     return st;
 }
 
@@ -1725,6 +1838,10 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Sec_TxEnc", c->TxEnc);
     RegLog(dev, L"Log_Ba_Req", c->BaReq);
     RegLog(dev, L"Log_TxAsync_Sub", (ULONG)c->TxAsyncSub);
+    RegLog(dev, L"Log_TxAgg_Batches", c->TxAggBatches);
+    RegLog(dev, L"Log_TxAgg_Frames", c->TxAggFrames);
+    RegLog(dev, L"Log_TxAgg_Num", c->TxAggNum);
+    RegLog(dev, L"Log_TxAgg_Pos", c->TxAggPos);
     RegLog(dev, L"Log_TxAsync_Fail", (ULONG)c->TxAsyncFail);
     RegLog(dev, L"Log_Ba_Resp", c->BaResp);
     RegLog(dev, L"Log_Sec_RxProt", c->RxProt);
@@ -1841,6 +1958,28 @@ static VOID EvtTxWork(WDFWORKITEM wi)
             len = c->TxQLen[idx];
             WdfSpinLockRelease(c->TxQLock);
             if (!have) break;
+            if (c->TxAggNum >= 2 && c->TxAsyncOk && c->JoinState == JOIN_UP && c->HwReady && !c->Stopping &&
+                !(c->TxQ[idx][16] & 1)) {
+                /* gather up to TxAggNum unicast frames into one bulk transfer */
+                const UCHAR *fr[6]; ULONG fl[6], cnt = 0, total = 0, avail;
+                WdfSpinLockAcquire(c->TxQLock);
+                avail = c->TxQHead - c->TxQTail;
+                WdfSpinLockRelease(c->TxQLock);
+                while (cnt < c->TxAggNum && cnt < avail) {
+                    ULONG ix = (c->TxQTail + cnt) % TXQ_N, l = c->TxQLen[ix], need = (TXDESC_LEN + l + 8 + 7) & ~7u;
+                    if (c->TxQ[ix][16] & 1) break;                       /* multicast/broadcast: send alone */
+                    if (total + need > TXA_BUF - 64) break;
+                    fr[cnt] = c->TxQ[ix]; fl[cnt] = l; total += need; cnt++;
+                }
+                if (cnt >= 2 && (total % 512) == 0) cnt--;               /* avoid a transfer ending on a packet boundary */
+                if (cnt >= 2) {
+                    (VOID)Tx_SendBatch(c, fr, fl, cnt);
+                    WdfSpinLockAcquire(c->TxQLock);
+                    c->TxQTail += cnt;
+                    WdfSpinLockRelease(c->TxQLock);
+                    continue;
+                }
+            }
             if (c->JoinState == JOIN_UP && c->HwReady && !c->Stopping)
                 (VOID)Tx_Raw(c, c->TxQ[idx], len, FALSE, (BOOLEAN)(c->TxQ[idx][16] & 1));
             WdfSpinLockAcquire(c->TxQLock);

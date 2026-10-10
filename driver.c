@@ -91,7 +91,7 @@
 #define SCAN_DIRECTED_MS    100
 #define TXQ_N               32
 #define TXQ_BUF             1600
-#define TXD_RATE_DATA       3         /* CCK 11M, fixed until rate control (5e) */
+#define TXD_RATE_DATA       8         /* OFDM 24M default (3 = 11M CCK, 11 = 54M), fixed until TX rate control */
 #define JOIN_IDLE           0
 #define JOIN_AUTH           1
 #define JOIN_ASSOC          2
@@ -1240,6 +1240,9 @@ static ULONG Join_BuildAssocReq(PDEVICE_CONTEXT c, UCHAR *f)
     f[n++] = 0x0C; f[n++] = 0x12; f[n++] = 0x18; f[n++] = 0x24;
     f[n++] = 50; f[n++] = 4;                      /* extended rates: 24,36,48,54 */
     f[n++] = 0x30; f[n++] = 0x48; f[n++] = 0x60; f[n++] = 0x6C;
+    {   /* HT capabilities exactly as rtl8xxxu sends them (20 MHz, SGI20, MCS0-7): lets the AP use 11n rates towards us */
+        RtlCopyMemory(f + n, g_ProbeTmpl + PROBE_LEN - 28, 28); n += 28;   /* tail of the probe template = HT cap IE */
+    }
     if (c->JoinExtIeLen && n + c->JoinExtIeLen < 400) {   /* RSN / vendor IEs from Windows */
         RtlCopyMemory(f + n, c->JoinExtIe, c->JoinExtIeLen);
         n += c->JoinExtIeLen;

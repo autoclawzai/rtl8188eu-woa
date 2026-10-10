@@ -523,8 +523,8 @@ extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT
         WDI_INDICATION_LINK_STATE_CHANGE_PARAMETERS ls = {};
         WDI_LINK_INFO_CONTAINER li = {};
         RtlCopyMemory(&ls.LinkStateChangeParameters.PeerMACAddress, Bssid, 6);
-        ls.LinkStateChangeParameters.TxLinkSpeed = 11000;
-        ls.LinkStateChangeParameters.RxLinkSpeed = 11000;
+        ls.LinkStateChangeParameters.TxLinkSpeed = 24000;
+        ls.LinkStateChangeParameters.RxLinkSpeed = 65000;
         ls.LinkStateChangeParameters.LinkQuality = 60;
         li.LinkID = 0;
         RtlCopyMemory(&li.LocalLinkMACAddress, ctx->Mac, 6);

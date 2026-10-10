@@ -1593,7 +1593,6 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
         InterlockedExchange(&c->JoinState, JOIN_IDLE);
         if (c->HwReady) Join_HwDown(c);
         if (!c->Stopping) WifiCx_OnDisconnectDone(dev);
-        if (c->HwReady && !c->Stopping) ScanStart(c);          /* refresh the BSS list */
     }
 }
 
@@ -1693,7 +1692,6 @@ static VOID EvtLossWork(WDFWORKITEM wi)
     if (c->Stopping) return;
     if (c->HwReady) Join_HwDown(c);
     WifiCx_OnLinkLost(dev, c->LossReason);
-    if (c->HwReady && !c->Stopping) ScanStart(c);          /* refresh the BSS list so Windows can see the AP again */
 }
 
 /* ---- data TX queue (PASSIVE worker drains frames queued at DISPATCH) ---- */

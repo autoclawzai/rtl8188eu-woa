@@ -112,6 +112,8 @@ enum { SCAN_PASSIVE = 1, SCAN_ACTIVE = 2, SCAN_DIRECTED = 3 };
 
 
 #define KEYQ_N 8
+#define BAQ_N 4
+typedef struct _BA_REQ { UCHAR Token; USHORT Param, Timeout; } BA_REQ;
 typedef struct _KEY_REQ {
     UCHAR Op;                /* 1 add, 2 delete */
     UCHAR Group, KeyId, HasMac;
@@ -164,7 +166,9 @@ typedef struct _DEVICE_CONTEXT {
     WDFUSBPIPE      TxPipeData;             /* bulk OUT for BE queue (second out endpoint) */
     WDFWAITLOCK     TxLock;                 /* serialises TxDataBuf users */
     WDFSPINLOCK     TxQLock;
-    WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork, KeyWork;
+    WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork, KeyWork, BaWork;
+    BA_REQ          BaQ[BAQ_N];
+    ULONG           BaQHead, BaQTail, BaReq, BaResp, BaEnable;
     /* phase 5d-B: WPA2 / CCMP via the hardware CAM */
     KEY_REQ         KeyQ[KEYQ_N];
     ULONG           KeyQHead, KeyQTail;
@@ -1518,6 +1522,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
     c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     c->RxNativeMode = RegGetUlong(dev, L"Cfg_RxNative", 1);
+    c->BaEnable = RegGetUlong(dev, L"Cfg_Ba", 1); c->BaReq = c->BaResp = 0; c->BaQTail = c->BaQHead;
     Join_StopScan(c);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;
@@ -1625,6 +1630,8 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     { ULONG q; WCHAR cn[24]; for (q = 0; q < 5; q++) { RtlStringCbPrintfW(cn, sizeof(cn), L"Log_Dbg_TxCls%u", q); RegLog(dev, cn, c->TxCls[q]); } }
     RegLog(dev, L"Log_Dbg_TxNative", c->TxNative);
     RegLog(dev, L"Log_Sec_TxEnc", c->TxEnc);
+    RegLog(dev, L"Log_Ba_Req", c->BaReq);
+    RegLog(dev, L"Log_Ba_Resp", c->BaResp);
     RegLog(dev, L"Log_Sec_RxProt", c->RxProt);
     RegLog(dev, L"Log_Sec_RxProtDrop", c->RxProtDrop);
     RegLog(dev, L"Log_Sec_RxProtV0", c->RxProtV0);
@@ -1683,6 +1690,31 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     RegLog(dev, L"Log_Rate_Pick11M", c->PickN[3]);
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
+}
+
+/* AP asks for a Block-Ack agreement (RX direction): accept it so the AP sends A-MPDUs. The hardware
+ * answers the BlockAck itself; we only have to send the ADDBA response (PASSIVE worker). */
+static VOID EvtBaWork(WDFWORKITEM wi)
+{
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
+    PDEVICE_CONTEXT c = GetDeviceContext(dev);
+    for (;;) {
+        BA_REQ r; UCHAR f[24 + 9]; USHORT prm;
+        WdfSpinLockAcquire(c->TxQLock);
+        if (c->BaQHead == c->BaQTail) { WdfSpinLockRelease(c->TxQLock); break; }
+        r = c->BaQ[c->BaQTail % BAQ_N];
+        c->BaQTail++;
+        WdfSpinLockRelease(c->TxQLock);
+        if (c->JoinState != JOIN_UP || !c->HwReady || c->Stopping) continue;
+        Mgmt_Header(c, f, 0xD0);                         /* action */
+        f[24] = 3; f[25] = 1; f[26] = r.Token;           /* BlockAck category, ADDBA response */
+        f[27] = 0; f[28] = 0;                            /* status: success */
+        prm = (USHORT)((r.Param & 0xFFFC) | 0x0002);      /* keep TID + buffer size, immediate BA, no A-MSDU */
+        f[29] = (UCHAR)prm; f[30] = (UCHAR)(prm >> 8);
+        f[31] = (UCHAR)r.Timeout; f[32] = (UCHAR)(r.Timeout >> 8);
+        (VOID)Tx_Raw(c, f, sizeof(f), TRUE, FALSE);
+        c->BaResp++;
+    }
 }
 
 static VOID EvtLossWork(WDFWORKITEM wi)
@@ -1768,6 +1800,17 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
             RtlCopyMemory(c->AssocResp, f + 24, bl);
             c->AssocRespLen = bl;
             KeSetEvent(&c->JoinEvent, 0, FALSE);
+        } else if (sub == 13 && state == JOIN_UP && c->BaEnable && len >= 24 + 9 && f[24] == 3 && f[25] == 0) {
+            BA_REQ *q;                                    /* ADDBA request */
+            c->BaReq++;
+            WdfSpinLockAcquire(c->TxQLock);
+            if (c->BaQHead - c->BaQTail < BAQ_N) {
+                q = &c->BaQ[c->BaQHead % BAQ_N];
+                q->Token = f[26]; q->Param = Le16(f + 27); q->Timeout = Le16(f + 29);
+                c->BaQHead++;
+                WdfSpinLockRelease(c->TxQLock);
+                WdfWorkItemEnqueue(c->BaWork);
+            } else WdfSpinLockRelease(c->TxQLock);
         } else if ((sub == 12 || sub == 10) && state == JOIN_UP && len >= 26) {
             c->LossReason = Le16(f + 24);
             if (InterlockedCompareExchange(&c->JoinState, JOIN_IDLE, JOIN_UP) == JOIN_UP)
@@ -2052,6 +2095,13 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     st = WdfWorkItemCreate(&wcfg, &attr, &c->KeyWork);
     if (!NT_SUCCESS(st)) return st;
 
+    WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtBaWork);
+    wcfg.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attr);
+    attr.ParentObject = dev;
+    st = WdfWorkItemCreate(&wcfg, &attr, &c->BaWork);
+    if (!NT_SUCCESS(st)) return st;
+
     WDF_WORKITEM_CONFIG_INIT(&wcfg, EvtTxWork);
     wcfg.AutomaticSerialization = FALSE;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
@@ -2245,6 +2295,7 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     WdfWorkItemFlush(ctx->LossWork);
     WdfWorkItemFlush(ctx->TxWork);
     WdfWorkItemFlush(ctx->KeyWork);
+    WdfWorkItemFlush(ctx->BaWork);
     /* stop+flush twice: a work item that was already running may re-arm the timer once */
     WdfTimerStop(ctx->ScanTimer, TRUE);
     WdfWorkItemFlush(ctx->ScanWork);

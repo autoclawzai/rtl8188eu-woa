@@ -1,5 +1,6 @@
 # Speed A/B test (Cfg_Ba=1 vs 0). Administrator PowerShell, dist folder se chalao. Output: Desktop\speed.txt
 param([int]$Rounds = 3, [string]$Ssid = "Airtel_Thanks")
+$ProgressPreference = 'SilentlyContinue'
 $o = "$env:USERPROFILE\Desktop\speed.txt"
 $dev = Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_2357&PID_010C' } | Select-Object -First 1
 $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($dev.InstanceId)\Device Parameters"

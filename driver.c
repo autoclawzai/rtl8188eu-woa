@@ -194,6 +194,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxQ[TXQ_N][TXQ_BUF];
     UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
     volatile LONG   TxWorkRunning;
+    volatile LONG   TxRate;                 /* Cfg_TxRate: descriptor rate id (3=11M CCK, 11=54M OFDM, 12+=MCS0..) */
     volatile LONG   TxMode;                 /* experiment: Cfg_TxMode registry value, see Tx_Raw */
     ULONG           RxNativeMode, TxNative, RxNative, TxAll, TxCls[5], TxFirstMs, TxLastMs, DbgTxN, DbgRxN; ULONGLONG UpMs; USHORT DbgTxLen[10], DbgRxLen[12]; ULONG DbgRxMs[12], DbgTxMs[10];
     UCHAR           DbgTx[10][96], DbgRx[12][96];
@@ -1137,7 +1138,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     UCHAR i;
     PUCHAR b = c->TxDataBuf, f = c->TxDataBuf + TXDESC_LEN;
     LONG mode = mgmt ? 0 : c->TxMode;
-    ULONG queue = 0, rate = TXD_RATE_DATA;
+    ULONG queue = 0, rate = (ULONG)c->TxRate & 0x7F;
     BOOLEAN useMgmtPipe = FALSE, qos = (BOOLEAN)(frame[0] == 0x88), enc = FALSE;
     WDFUSBPIPE pipe;
     WDF_MEMORY_DESCRIPTOR md;
@@ -1494,6 +1495,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     UCHAR req[440];
 
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
+    c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     c->RxNativeMode = RegGetUlong(dev, L"Cfg_RxNative", 1);
     Join_StopScan(c);
     st = ScanHop(c, c->JoinCh, TRUE);
@@ -1648,7 +1650,9 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     if (c->Stopping) return;
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
+    c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     RegLog(dev, L"Log_TxMode_Active", (ULONG)c->TxMode);
+    RegLog(dev, L"Log_TxRate_Active", (ULONG)c->TxRate);
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }

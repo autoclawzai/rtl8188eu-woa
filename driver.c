@@ -89,7 +89,8 @@
 #define SCAN_PASSIVE_MS     300
 #define SCAN_ACTIVE_MS      75
 #define SCAN_DIRECTED_MS    100
-#define TXQ_N               32
+#define TXQ_N               256
+#define TXA_N               8
 #define TXQ_BUF             1600
 #define TXD_RATE_DATA       0         /* 0 = automatic (RSSI based), else fixed descriptor rate id (3 = 11M CCK, 11 = 54M, 12+ = MCS0..) */
 #define JOIN_IDLE           0
@@ -113,6 +114,8 @@ enum { SCAN_PASSIVE = 1, SCAN_ACTIVE = 2, SCAN_DIRECTED = 3 };
 
 #define KEYQ_N 8
 #define BAQ_N 4
+struct _DEVICE_CONTEXT;
+typedef struct _TXSLOT { WDFREQUEST Req; WDFMEMORY Mem; PUCHAR Buf; volatile LONG InUse; struct _DEVICE_CONTEXT *C; } TXSLOT;
 typedef struct _BA_REQ { UCHAR Token; USHORT Param, Timeout; } BA_REQ;
 typedef struct _KEY_REQ {
     UCHAR Op;                /* 1 add, 2 delete */
@@ -168,6 +171,10 @@ typedef struct _DEVICE_CONTEXT {
     WDFSPINLOCK     TxQLock;
     WDFWORKITEM     JoinWork, LossWork, TxWork, StatsWork, KeyWork, BaWork;
     BA_REQ          BaQ[BAQ_N];
+    TXSLOT          TxSlot[TXA_N];
+    KSEMAPHORE      TxSem;
+    BOOLEAN         TxAsyncOk;
+    volatile LONG   TxAsyncFail, TxAsyncSub;
     ULONG           BaQHead, BaQTail, BaReq, BaResp, BaEnable;
     /* phase 5d-B: WPA2 / CCMP via the hardware CAM */
     KEY_REQ         KeyQ[KEYQ_N];
@@ -1150,6 +1157,58 @@ static ULONG Tx_PickRate(PDEVICE_CONTEXT c)
     return pick;
 }
 
+static VOID EvtTxDone(WDFREQUEST req, WDFIOTARGET tgt, PWDF_REQUEST_COMPLETION_PARAMS p, WDFCONTEXT ctx)
+{
+    TXSLOT *s = (TXSLOT *)ctx;
+    PDEVICE_CONTEXT c = (PDEVICE_CONTEXT)s->C;
+    UNREFERENCED_PARAMETER(req); UNREFERENCED_PARAMETER(tgt);
+    if (NT_SUCCESS(p->IoStatus.Status)) InterlockedIncrement((volatile LONG *)&c->DataTxOk);
+    else { InterlockedIncrement((volatile LONG *)&c->DataTxFail); InterlockedIncrement(&c->TxAsyncFail); }
+    InterlockedExchange(&s->InUse, 0);
+    KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
+}
+
+/* Slots for pipelined data TX; created once the bulk OUT pipes are known. */
+static VOID TxAsync_Init(WDFDEVICE dev, PDEVICE_CONTEXT c)
+{
+    ULONG k;
+    WDFUSBPIPE pipe = c->TxPipeData ? c->TxPipeData : c->TxPipe;
+    c->TxAsyncOk = FALSE;
+    if (!pipe) return;
+    if (c->TxSlot[0].Req) { c->TxAsyncOk = TRUE; return; }      /* already built (re-entry after D0Exit) */
+    KeInitializeSemaphore(&c->TxSem, TXA_N, TXA_N);
+    for (k = 0; k < TXA_N; k++) {
+        WDF_OBJECT_ATTRIBUTES a;
+        PVOID buf;
+        c->TxSlot[k].C = c; c->TxSlot[k].InUse = 0;
+        WDF_OBJECT_ATTRIBUTES_INIT(&a); a.ParentObject = dev;
+        if (!NT_SUCCESS(WdfRequestCreate(&a, WdfUsbTargetPipeGetIoTarget(pipe), &c->TxSlot[k].Req))) { c->TxSlot[0].Req = NULL; return; }
+        WDF_OBJECT_ATTRIBUTES_INIT(&a); a.ParentObject = dev;
+        if (!NT_SUCCESS(WdfMemoryCreate(&a, NonPagedPoolNx, 'xTxR', TXDESC_LEN + TXQ_BUF + 16, &c->TxSlot[k].Mem, &buf))) { c->TxSlot[0].Req = NULL; return; }
+        c->TxSlot[k].Buf = (PUCHAR)buf;
+    }
+    c->TxAsyncOk = (RegGetUlong(dev, L"Cfg_TxAsync", 1) != 0);
+}
+
+/* Wait until all in-flight async writes completed (cancel stragglers). */
+static VOID TxAsync_Drain(PDEVICE_CONTEXT c)
+{
+    ULONG k;
+    LARGE_INTEGER to;
+    if (!c->TxSlot[0].Req) return;
+    c->TxAsyncOk = FALSE;
+    to.QuadPart = -10000000;                       /* 1 s per slot */
+    for (k = 0; k < TXA_N; k++) {
+        if (KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &to) != STATUS_SUCCESS) {
+            ULONG j;
+            for (j = 0; j < TXA_N; j++) if (c->TxSlot[j].InUse) (VOID)WdfRequestCancelSentRequest(c->TxSlot[j].Req);
+            to.QuadPart = -30000000;
+            (VOID)KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &to);
+        }
+    }
+    KeReleaseSemaphore(&c->TxSem, 0, TXA_N, FALSE);
+}
+
 /* Generic TX through the descriptor. mgmt -> ep 0x02 / queue MGNT, data -> second endpoint / queue BE.
  * Called at PASSIVE_LEVEL only. frame = full 802.11 frame (seq ctrl is patched here). */
 static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN mgmt, BOOLEAN bmc)
@@ -1167,6 +1226,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     WDF_REQUEST_SEND_OPTIONS opts;
     ULONG_PTR written = 0;
     NTSTATUS st;
+    TXSLOT *slot = NULL;
 
     switch (mode) {
     case 1: queue = 0x12; useMgmtPipe = TRUE; break;      /* data frames through the MGNT queue / ep 0x02 */
@@ -1180,7 +1240,17 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     pipe = (mgmt || useMgmtPipe) ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
     if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
 
-    WdfWaitLockAcquire(c->TxLock, NULL);
+    if (!mgmt && mode == 0 && c->TxAsyncOk) {      /* pipelined data TX: take a free slot */
+        LARGE_INTEGER to; ULONG k;
+        to.QuadPart = -5000000;                    /* 500 ms */
+        if (KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &to) != STATUS_SUCCESS) return STATUS_IO_TIMEOUT;
+        for (k = 0; k < TXA_N; k++)
+            if (InterlockedCompareExchange(&c->TxSlot[k].InUse, 1, 0) == 0) { slot = &c->TxSlot[k]; break; }
+        if (!slot) { KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE); return STATUS_DEVICE_BUSY; }
+        b = slot->Buf; f = b + TXDESC_LEN;
+    } else {
+        WdfWaitLockAcquire(c->TxLock, NULL);
+    }
     seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
     {
         /* WPA2: protect unicast/ToDS data frames (not EAPOL) with CCMP. We add the 8 byte CCMP header,
@@ -1218,6 +1288,29 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     w[7] |= ck;
     RtlCopyMemory(b, w, TXDESC_LEN);
 
+    if (slot) {
+        WDF_REQUEST_REUSE_PARAMS rp;
+        WDFMEMORY_OFFSET off;
+        InterlockedIncrement(&c->TxAsyncSub);
+        WDF_REQUEST_REUSE_PARAMS_INIT(&rp, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
+        st = WdfRequestReuse(slot->Req, &rp);
+        if (NT_SUCCESS(st)) {
+            off.BufferOffset = 0; off.BufferLength = TXDESC_LEN + fl;
+            st = WdfUsbTargetPipeFormatRequestForWrite(pipe, slot->Req, slot->Mem, &off);
+        }
+        if (NT_SUCCESS(st)) {
+            WdfRequestSetCompletionRoutine(slot->Req, EvtTxDone, slot);
+            WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
+            WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
+            if (!WdfRequestSend(slot->Req, WdfUsbTargetPipeGetIoTarget(pipe), &opts)) st = WdfRequestGetStatus(slot->Req);
+            else return STATUS_SUCCESS;            /* completion routine counts the result and frees the slot */
+        }
+        c->DataTxFail++;
+        InterlockedIncrement(&c->TxAsyncFail);
+        InterlockedExchange(&slot->InUse, 0);
+        KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
+        return st;
+    }
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, TXDESC_LEN + fl);
     WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
     WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
@@ -1631,6 +1724,8 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Dbg_TxNative", c->TxNative);
     RegLog(dev, L"Log_Sec_TxEnc", c->TxEnc);
     RegLog(dev, L"Log_Ba_Req", c->BaReq);
+    RegLog(dev, L"Log_TxAsync_Sub", (ULONG)c->TxAsyncSub);
+    RegLog(dev, L"Log_TxAsync_Fail", (ULONG)c->TxAsyncFail);
     RegLog(dev, L"Log_Ba_Resp", c->BaResp);
     RegLog(dev, L"Log_Sec_RxProt", c->RxProt);
     RegLog(dev, L"Log_Sec_RxProtDrop", c->RxProtDrop);
@@ -2263,6 +2358,7 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     RegLog(dev, L"Log_Pwr_Mismatch", Rtl_TxPowerSelfCheck(ctx));
     RegLog(dev, L"Log_Stage", 11);  /* RF/cal replayed */
 
+    TxAsync_Init(dev, ctx);
     InterlockedExchange(&ctx->HwReady, 1);
 
     /* Make sure the continuous reader is actually running (osrusbfx2 does the same):
@@ -2296,6 +2392,7 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     WdfWorkItemFlush(ctx->TxWork);
     WdfWorkItemFlush(ctx->KeyWork);
     WdfWorkItemFlush(ctx->BaWork);
+    TxAsync_Drain(ctx);
     /* stop+flush twice: a work item that was already running may re-arm the timer once */
     WdfTimerStop(ctx->ScanTimer, TRUE);
     WdfWorkItemFlush(ctx->ScanWork);

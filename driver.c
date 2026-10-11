@@ -194,6 +194,9 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinSsid[32];
     UCHAR           JoinSsidLen;
     UCHAR           JoinCh;
+    ULONG           Ht40Cfg, DescMode;       /* Cfg_Ht40 (0/1), Cfg_DescMode (0 = old descriptor, 1 = real Realtek style) */
+    volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
+    UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
     UCHAR           JoinExtIe[256];
     ULONG           JoinExtIeLen;
     USHORT          JoinAid, JoinStatus, JoinCap, LossReason;
@@ -205,7 +208,7 @@ typedef struct _DEVICE_CONTEXT {
     ULONG           TxQHead, TxQTail;
     USHORT          TxQLen[TXQ_N];
     UCHAR           TxQ[TXQ_N][TXQ_BUF];
-    UCHAR           TxDataBuf[TXDESC_LEN + TXQ_BUF];
+    UCHAR           TxDataBuf[TXDESC_LEN + 16 + TXQ_BUF];
     volatile LONG   TxWorkRunning;
     volatile LONG   RssiCck, RssiOfdm;      /* smoothed RSSI (dBm) per frame class from the AP, 0 = no sample yet */
     ULONG           RssiNCck, RssiNOfdm, PickN[4];
@@ -947,9 +950,65 @@ static VOID SnapPhase(PDEVICE_CONTEXT c, ULONG i)
     WdfSpinLockRelease(c->BssLock);
 }
 
+/* ---- HT40 (register values captured from the real Realtek driver: AP ch11, secondary below, centre 9) ---- */
+static NTSTATUS Rtl_Bw20Restore(PDEVICE_CONTEXT c)
+{
+    NTSTATUS st;
+    CHK(Rtl_Write8 (c, 0x0603, 0x04));
+    CHK(Rtl_Write32(c, 0x0800, 0x83040000u));
+    CHK(Rtl_Write32(c, 0x0900, 0x00000000u));
+    CHK(Rtl_Write32(c, 0x0A00, 0x00D047C8u));
+    CHK(Rtl_Write32(c, 0x0D00, 0x00000740u));
+    CHK(Rtl_Write32(c, 0x0818, 0x02200385u));
+    InterlockedExchange(&c->Bw40Active, 0);
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS Rtl_Bw40Apply(PDEVICE_CONTEXT c, UCHAR primary, BOOLEAN minus)
+{
+    NTSTATUS st;
+    UCHAR center = minus ? (UCHAR)(primary - 2) : (UCHAR)(primary + 2);
+    CHK(Rtl_Write8 (c, 0x0603, 0x00));
+    CHK(Rtl_Write32(c, 0x0800, 0x83040001u));
+    CHK(Rtl_Write32(c, 0x0900, 0x00000001u));
+    CHK(Rtl_Write32(c, 0x0A00, minus ? 0x00D047D8u : 0x00D047C8u));   /* CCK side band (plus case not seen in the capture) */
+    CHK(Rtl_Write32(c, 0x0D00, minus ? 0x00000B40u : 0x00000740u));   /* OFDM primary channel field */
+    CHK(Rtl_Write32(c, 0x0818, 0x06200385u));
+    CHK(Rtl_Write32(c, 0x0840, 0x01800400u | center));                  /* RF 0x18: BW40 | centre channel */
+    c->Bw40Primary = primary; c->Bw40Minus = minus ? 1 : 0; c->Bw40Center = center;
+    InterlockedExchange(&c->Bw40Active, 1);
+    return STATUS_SUCCESS;
+}
+
+/* Looks at the AP's HT Operation IE (from the scan body). Returns 0 = stay 20 MHz, 1 = secondary above, 3 = secondary below. */
+static UCHAR Join_ApSecondary(PDEVICE_CONTEXT c)
+{
+    ULONG i, o;
+    UCHAR r = 0, caps40 = 0;
+    WdfSpinLockAcquire(c->BssLock);
+    for (i = 0; i < c->BssCount; i++) {
+        if (RtlCompareMemory(c->Bss[i].Bssid, c->JoinBssid, 6) != 6) continue;
+        o = 12;
+        while (o + 2 <= c->Bss[i].BodyLen) {
+            UCHAR id = c->Bss[i].Body[o], l = c->Bss[i].Body[o + 1];
+            if (o + 2 + l > c->Bss[i].BodyLen) break;
+            if (id == 45 && l >= 2) caps40 = (UCHAR)((c->Bss[i].Body[o + 2] >> 1) & 1);
+            if (id == 61 && l >= 2) {
+                UCHAR b = c->Bss[i].Body[o + 3];
+                if ((b & 0x04) && ((b & 3) == 1 || (b & 3) == 3)) r = (UCHAR)(b & 3);
+            }
+            o += 2 + l;
+        }
+        break;
+    }
+    WdfSpinLockRelease(c->BssLock);
+    return caps40 ? r : 0;
+}
+
 static NTSTATUS ScanHop(PDEVICE_CONTEXT c, UCHAR ch, BOOLEAN withTxSetup)
 {
     NTSTATUS st;
+    if (c->Bw40Active) (VOID)Rtl_Bw20Restore(c);
     if (withTxSetup) CHK(Rtl_TxChannelSetup(c, ch));
     CHK(Rtl_SetChannel(c, ch));
     c->CurCh = ch;
@@ -1072,6 +1131,9 @@ static VOID ScanFinish(WDFDEVICE dev, PDEVICE_CONTEXT c)
     LOG("scan done st=0x%08x tx ok=%lu fail=%lu probe_resp=%lu", c->ScanStatus, c->TxOk, c->TxFail, sn[2][3]);
     if (NT_SUCCESS(c->ScanStatus)) RegLog(dev, L"Log_Stage", 13);   /* all scan phases finished */
     c->FastScan = 0;
+    if (c->Bw40Want && !c->Bw40Active && c->JoinState == JOIN_UP && c->HwReady) {
+        if (NT_SUCCESS(Rtl_TxChannelSetup(c, c->Bw40Primary))) (VOID)Rtl_Bw40Apply(c, c->Bw40Primary, (BOOLEAN)c->Bw40Minus);
+    }
     WifiCx_OnScanComplete(dev);          /* answers a pending WDI scan task (if any) */
     InterlockedExchange(&c->ScanRunning, 0);
 }
@@ -1232,6 +1294,8 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     ULONG_PTR written = 0;
     NTSTATUS st;
     TXSLOT *slot = NULL;
+    ULONG hdr = TXDESC_LEN;                          /* descriptor + optional 16 byte pad (real Realtek layout) */
+    BOOLEAN real = (BOOLEAN)(!mgmt && c->DescMode == 1 && mode == 0);
 
     switch (mode) {
     case 1: queue = 0x12; useMgmtPipe = TRUE; break;      /* data frames through the MGNT queue / ep 0x02 */
@@ -1252,10 +1316,11 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         for (k = 0; k < TXA_N; k++)
             if (InterlockedCompareExchange(&c->TxSlot[k].InUse, 1, 0) == 0) { slot = &c->TxSlot[k]; break; }
         if (!slot) { KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE); return STATUS_DEVICE_BUSY; }
-        b = slot->Buf; f = b + TXDESC_LEN;
+        b = slot->Buf; f = b + (real ? TXDESC_LEN + 16 : TXDESC_LEN);
     } else {
         WdfWaitLockAcquire(c->TxLock, NULL);
     }
+    if (real) { hdr = TXDESC_LEN + 16; f = b + hdr; }
     seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
     {
         /* WPA2: protect unicast/ToDS data frames (not EAPOL) with CCMP. We add the 8 byte CCMP header,
@@ -1289,6 +1354,16 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     w[5] = mgmt ? 0x001A0000u : (queue == 0x12 ? (0x001A0000u | rate) : (0x0001FF00u | rate));
     w[6] = 0;
     w[7] = 0x20000000u;
+    if (real) {   /* layout of the data descriptors seen from the real Realtek driver (usb capture) */
+        w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
+        w[1] = 0x08000000u | (queue << 8) | (enc ? 0x00C00000u : 0);
+        w[2] = 0x00701000u;                                   /* AGG_EN + AMPDU density 7, no AGG_BREAK / antenna bits */
+        w[4] = c->Bw40Active ? 0x02000908u : 0x00000908u;     /* RTS rate 24M, CTS-self, DATA_BW */
+        w[5] = 0x0001FF00u | rate | (rate >= 12 ? 0x40u : 0); /* SGI for MCS rates */
+        w[6] = 0x6666F800u;                                   /* rate fallback table */
+        w[7] = 0;
+        RtlZeroMemory(b + TXDESC_LEN, 16);
+    }
     for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
     w[7] |= ck;
     RtlCopyMemory(b, w, TXDESC_LEN);
@@ -1300,7 +1375,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         WDF_REQUEST_REUSE_PARAMS_INIT(&rp, WDF_REQUEST_REUSE_NO_FLAGS, STATUS_SUCCESS);
         st = WdfRequestReuse(slot->Req, &rp);
         if (NT_SUCCESS(st)) {
-            off.BufferOffset = 0; off.BufferLength = TXDESC_LEN + fl;
+            off.BufferOffset = 0; off.BufferLength = hdr + fl;
             st = WdfUsbTargetPipeFormatRequestForWrite(pipe, slot->Req, slot->Mem, &off);
         }
         if (NT_SUCCESS(st)) {
@@ -1316,11 +1391,11 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
         return st;
     }
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, TXDESC_LEN + fl);
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&md, b, hdr + fl);
     WDF_REQUEST_SEND_OPTIONS_INIT(&opts, WDF_REQUEST_SEND_OPTION_TIMEOUT);
     WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&opts, WDF_REL_TIMEOUT_IN_MS(500));
     st = WdfUsbTargetPipeWriteSynchronously(pipe, WDF_NO_HANDLE, &opts, &md, (PULONG)&written);
-    if (NT_SUCCESS(st) && written != TXDESC_LEN + fl) st = STATUS_IO_DEVICE_ERROR;
+    if (NT_SUCCESS(st) && written != hdr + fl) st = STATUS_IO_DEVICE_ERROR;
     WdfWaitLockRelease(c->TxLock);
     if (mgmt) { if (NT_SUCCESS(st)) c->TxOk++; else c->TxFail++; }
     else { if (NT_SUCCESS(st)) c->DataTxOk++; else c->DataTxFail++; }
@@ -1469,7 +1544,9 @@ static ULONG Join_BuildAssocReq(PDEVICE_CONTEXT c, UCHAR *f)
     f[n++] = 50; f[n++] = 4;                      /* extended rates: 24,36,48,54 */
     f[n++] = 0x30; f[n++] = 0x48; f[n++] = 0x60; f[n++] = 0x6C;
     {   /* HT capabilities exactly as rtl8xxxu sends them (20 MHz, SGI20, MCS0-7): lets the AP use 11n rates towards us */
-        RtlCopyMemory(f + n, g_ProbeTmpl + PROBE_LEN - 28, 28); n += 28;   /* tail of the probe template = HT cap IE */
+        RtlCopyMemory(f + n, g_ProbeTmpl + PROBE_LEN - 28, 28);   /* tail of the probe template = HT cap IE */
+        if (c->Bw40Want) { f[n + 2] = 0x6E; f[n + 3] = 0x18; f[n + 4] = 0x02; }   /* cap info 0x186E (40 MHz, SGI40, 40M CCK) + A-MPDU param, like the real driver */
+        n += 28;
     }
     if (c->JoinExtIeLen && n + c->JoinExtIeLen < 400) {   /* RSN / vendor IEs from Windows */
         RtlCopyMemory(f + n, c->JoinExtIe, c->JoinExtIeLen);
@@ -1655,6 +1732,8 @@ static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
 
 static VOID Join_HwDown(PDEVICE_CONTEXT c)
 {
+    InterlockedExchange(&c->Bw40Want, 0);
+    if (c->Bw40Active) (VOID)Rtl_Bw20Restore(c);
     Sec_Reset(c);
     (VOID)Rtl_H2cMediaStatus(c, FALSE, 2, 0);
     (VOID)Rmw8(c, REG_BEACON_CTRL_, 0, 0x10);
@@ -1730,8 +1809,20 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->RxNativeMode = RegGetUlong(dev, L"Cfg_RxNative", 1);
     c->BaEnable = RegGetUlong(dev, L"Cfg_Ba", 1); c->BaReq = c->BaResp = 0; c->BaQTail = c->BaQHead;
     Join_StopScan(c);
+    c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
+    c->DescMode = RegGetUlong(dev, L"Cfg_DescMode", 1);
+    InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;
+    if (c->Ht40Cfg) {
+        UCHAR sec = Join_ApSecondary(c);
+        RegLog(dev, L"Log_Ht40_ApSec", sec);
+        if (sec) {
+            NTSTATUS bs = Rtl_Bw40Apply(c, c->JoinCh, (BOOLEAN)(sec == 3));
+            RegLog(dev, L"Log_Ht40_Status", (ULONG)bs);
+            if (NT_SUCCESS(bs)) InterlockedExchange(&c->Bw40Want, 1);
+        }
+    }
     SleepMs(5);
 
     /* --- authentication --- */

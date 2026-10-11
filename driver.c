@@ -2416,6 +2416,7 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST 
     st = Rtl_Read32(ctx, REG_SYS_CFG, &sysCfg);
     RegLog(dev, L"Log_SysCfg_Status", (ULONG)st);
     RegLog(dev, L"Log_SysCfg_Value", sysCfg);
+    { UCHAR fc = 0; if (NT_SUCCESS(Rtl_Read8(ctx, 0x00FC, &fc))) RegLog(dev, L"Log_Chip_RegFC", fc); }   /* Realtek driver switches on this byte */
     st = Rtl_Read16(ctx, REG_9346CR, &r9346);
     RegLog(dev, L"Log_Reg0A_Status", (ULONG)st);
     RegLog(dev, L"Log_Reg0A_Value", r9346);

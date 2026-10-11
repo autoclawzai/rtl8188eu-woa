@@ -1192,7 +1192,7 @@ static VOID TxAsync_Init(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->TxAsyncOk = (RegGetUlong(dev, L"Cfg_TxAsync", 1) != 0);
     c->TxAggNum = RegGetUlong(dev, L"Cfg_TxAgg", 0);          /* 0/1 = off, 2..6 = max frames per bulk transfer */
     if (c->TxAggNum > 6) c->TxAggNum = 6;
-    c->TxAggPos = RegGetUlong(dev, L"Cfg_TxAggPos", 2);
+    c->TxAggPos = RegGetUlong(dev, L"Cfg_TxAggPos", 0);
 }
 
 /* Wait until all in-flight async writes completed (cancel stragglers). */

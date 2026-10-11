@@ -9,7 +9,7 @@ function St { ((netsh wlan show interfaces | Select-String '^\s+State').ToString
 function Dl { try { $sw=[Diagnostics.Stopwatch]::StartNew(); $r=Invoke-WebRequest "http://speed.cloudflare.com/__down?bytes=30000000" -UseBasicParsing -TimeoutSec 40; $sw.Stop(); [math]::Round($r.RawContentLength*8/1e6/$sw.Elapsed.TotalSeconds,1) } catch { "err" } }
 function Ul { try { $b=New-Object byte[] 8000000; $sw=[Diagnostics.Stopwatch]::StartNew(); Invoke-WebRequest "http://speed.cloudflare.com/__up" -Method Post -Body $b -UseBasicParsing -TimeoutSec 40 | Out-Null; $sw.Stop(); [math]::Round(8000000*8/1e6/$sw.Elapsed.TotalSeconds,1) } catch { "err" } }
 "== agg test $(Get-Date) ==" | Out-File $o
-$variants = @( @{n=0;p=2;t="baseline (agg off)"}, @{n=4;p=2;t="agg 4, count in dword7[31:24]"}, @{n=4;p=0;t="agg 4, count in dword5[31:24]"} )
+$variants = @( @{n=0;p=0;t="baseline (agg off)"}, @{n=4;p=0;t="agg 4 (dword5, correct for this chip)"}, @{n=6;p=0;t="agg 6 (dword5)"} )
 foreach ($v in $variants) {
   Set-ItemProperty $k -Name Cfg_TxAgg -Value $v.n -Type DWord
   Set-ItemProperty $k -Name Cfg_TxAggPos -Value $v.p -Type DWord
@@ -23,7 +23,7 @@ foreach ($v in $variants) {
   if ($png -match '^(\d+)/10' -and [int]$Matches[1] -ge 5) {
     for ($r=1; $r -le 2; $r++) { "round $r down=$(Dl) Mbps up=$(Ul) Mbps" | Tee-Object -FilePath $o -Append }
   } else { "SKIP speed (connectivity broken)" | Tee-Object -FilePath $o -Append }
-  (Get-ItemProperty $k | Select-Object Log_Chip_RegFC,Log_TxAgg_*,Log_TxAsync_*,Log_Data_TxOk,Log_Data_TxFail,Log_Data_TxDrop,Log_Rate_PickMcs7) | Format-List | Out-File $o -Append
+  (Get-ItemProperty $k | Select-Object Log_Ba_Req,Log_Ba_Resp,Log_Chip_RegFC,Log_TxAgg_*,Log_TxAsync_*,Log_Data_TxOk,Log_Data_TxFail,Log_Data_TxDrop,Log_Rate_PickMcs7) | Format-List | Out-File $o -Append
 }
 Set-ItemProperty $k -Name Cfg_TxAgg -Value 0 -Type DWord
 "Done -> $o  (Cfg_TxAgg wapas 0 kar diya)"

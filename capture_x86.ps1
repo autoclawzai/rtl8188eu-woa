@@ -2,6 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File .\capture_x86.ps1
 # Pehli baar: USBPcap install karega -> PC RESTART karo -> script dobara chalao.
 # Dusri baar: capture lega -> Desktop\usb_capture.zip banayega -> wo zip mujhe bhej do.
+param([string]$CmdPath = "")
 $ErrorActionPreference = "Continue"
 $ProgressPreference = 'SilentlyContinue'
 $desk = [Environment]::GetFolderPath("Desktop")
@@ -12,7 +13,14 @@ function L($m) { $t = "[$(Get-Date -Format HH:mm:ss)] $m"; Write-Host $t; $t | O
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Write-Host "Administrator PowerShell chahiye." -ForegroundColor Red; return }
 
 # ---------- 1. USBPcap install ----------
-$cmd = @("$env:ProgramFiles\USBPcap\USBPcapCMD.exe", "${env:ProgramFiles(x86)}\USBPcap\USBPcapCMD.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+$cands = @($CmdPath, "$env:ProgramFiles\USBPcap\USBPcapCMD.exe", "${env:ProgramFiles(x86)}\USBPcap\USBPcapCMD.exe", "C:\Program Files\USBPcap\USBPcapCMD.exe")
+$cmd = $cands | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $cmd) { $g = Get-Command USBPcapCMD.exe -ErrorAction SilentlyContinue; if ($g) { $cmd = $g.Source } }
+if (-not $cmd) {   # registry uninstall entry / folder search
+  $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*", "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like "*USBPcap*" } | Select-Object -First 1
+  if ($reg -and $reg.InstallLocation) { $c = Join-Path $reg.InstallLocation "USBPcapCMD.exe"; if (Test-Path $c) { $cmd = $c } }
+}
+if (-not $cmd) { $f = Get-ChildItem "$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:USERPROFILE\Downloads" -Recurse -Filter USBPcapCMD.exe -ErrorAction SilentlyContinue | Select-Object -First 1; if ($f) { $cmd = $f.FullName } }
 if (-not $cmd) {
   L "USBPcap nahi mila, download kar raha hu (GitHub releases)"
   try {

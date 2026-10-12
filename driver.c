@@ -194,6 +194,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinSsid[32];
     UCHAR           JoinSsidLen;
     UCHAR           JoinCh;
+    volatile LONG   TxSemBlocked, TxWorkRuns, TxQMax;   /* TX pipeline diagnostics: all 8 USB slots busy / worker wakeups / max queued frames */
     ULONG           QosTx;                   /* Cfg_QosTx: convert Windows' plain data frames to QoS data (TID 0) like the real driver */
     UCHAR           TxQosTmp[TXQ_BUF + 4];
     ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
@@ -1322,7 +1323,9 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     if (!mgmt && mode == 0 && c->TxAsyncOk) {      /* pipelined data TX: take a free slot */
         LARGE_INTEGER to; ULONG k;
         to.QuadPart = -5000000;                    /* 500 ms */
+        { LARGE_INTEGER z; z.QuadPart = 0; if (KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &z) == STATUS_SUCCESS) goto have_slot; InterlockedIncrement(&c->TxSemBlocked); }
         if (KeWaitForSingleObject(&c->TxSem, Executive, KernelMode, FALSE, &to) != STATUS_SUCCESS) return STATUS_IO_TIMEOUT;
+    have_slot:
         for (k = 0; k < TXA_N; k++)
             if (InterlockedCompareExchange(&c->TxSlot[k].InUse, 1, 0) == 0) { slot = &c->TxSlot[k]; break; }
         if (!slot) { KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE); return STATUS_DEVICE_BUSY; }
@@ -1938,6 +1941,9 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     RegLog(dev, L"Log_Sec_TxEnc", c->TxEnc);
     RegLog(dev, L"Log_Ba_Req", c->BaReq);
     RegLog(dev, L"Log_TxAsync_Sub", (ULONG)c->TxAsyncSub);
+    RegLog(dev, L"Log_TxPipe_SemBlocked", (ULONG)c->TxSemBlocked);
+    RegLog(dev, L"Log_TxPipe_WorkRuns", (ULONG)c->TxWorkRuns);
+    RegLog(dev, L"Log_TxPipe_QueueMax", (ULONG)c->TxQMax);
     RegLog(dev, L"Log_TxAgg_Batches", c->TxAggBatches);
     RegLog(dev, L"Log_TxAgg_Frames", c->TxAggFrames);
     RegLog(dev, L"Log_TxAgg_Num", c->TxAggNum);
@@ -2045,6 +2051,7 @@ static VOID EvtTxWork(WDFWORKITEM wi)
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
 
+    InterlockedIncrement(&c->TxWorkRuns);
     /* a work item may run concurrently with itself: only one drainer, and re-check after releasing */
     for (;;) {
         BOOLEAN more;
@@ -2274,6 +2281,7 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
         WdfSpinLockRelease(c->TxQLock);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    { LONG dq = (LONG)(c->TxQHead - c->TxQTail); if (dq > c->TxQMax) c->TxQMax = dq; }
     idx = c->TxQHead % TXQ_N;
     f = c->TxQ[idx];
     if (len >= 32 && len <= TXQ_BUF && (eth[0] & 0x0F) == 0x08 && (eth[1] & 3) == 1 &&

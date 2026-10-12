@@ -62,6 +62,7 @@ void __cdecl operator delete[](void* p, ULONG_PTR) noexcept { if (p) ExFreePoolW
 /* ------------------------------------------------------------------ */
 /* wifi context (second context on the device object)                  */
 /* ------------------------------------------------------------------ */
+#define RX_RING_N 512      /* frames buffered between the USB completion and the NetAdapter rx queue (64 dropped ~1% in a download) */
 typedef struct _WIFI_CTX {
     WDFDEVICE   Device;
     TLV_CONTEXT Tlv;
@@ -90,8 +91,8 @@ typedef struct _WIFI_CTX {
     NETPACKETQUEUE RxQueue;
     volatile LONG RxNotifyArmed;
     ULONG       RxHead, RxTail;
-    USHORT      RxLen[64];
-    UCHAR       Rx[64][1536];
+    USHORT      RxLen[RX_RING_N];
+    UCHAR       Rx[RX_RING_N][1536];
     ULONG       RxDropped;
 } WIFI_CTX, *PWIFI_CTX;
 
@@ -664,7 +665,7 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
         if (!NetFragmentIteratorHasAny(&fi)) break;
         KeAcquireSpinLock(&w->RxLock, &irql);
         if (w->RxHead == w->RxTail) { KeReleaseSpinLock(&w->RxLock, irql); break; }
-        ULONG idx = w->RxTail % 64;
+        ULONG idx = w->RxTail % RX_RING_N;
         NET_FRAGMENT* fr = NetFragmentIteratorGetFragment(&fi);
         ULONG len = w->RxLen[idx];
         if (len <= fr->Capacity) {
@@ -764,8 +765,8 @@ extern "C" VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR* Da, const UCHAR* 
 
     if (PayloadLen + 14 > sizeof(w->Rx[0])) return;
     KeAcquireSpinLock(&w->RxLock, &irql);
-    if (w->RxHead - w->RxTail < 64) {
-        ULONG idx = w->RxHead % 64;
+    if (w->RxHead - w->RxTail < RX_RING_N) {
+        ULONG idx = w->RxHead % RX_RING_N;
         UCHAR* d = w->Rx[idx];
         RtlCopyMemory(d, Da, 6);
         RtlCopyMemory(d + 6, Sa, 6);
@@ -789,8 +790,8 @@ extern "C" VOID WifiCx_OnRxFrame(WDFDEVICE Device, const UCHAR* Frame, ULONG Len
 
     if (Len > sizeof(w->Rx[0]) || Len < 24) return;
     KeAcquireSpinLock(&w->RxLock, &irql);
-    if (w->RxHead - w->RxTail < 64) {
-        ULONG idx = w->RxHead % 64;
+    if (w->RxHead - w->RxTail < RX_RING_N) {
+        ULONG idx = w->RxHead % RX_RING_N;
         RtlCopyMemory(w->Rx[idx], Frame, Len);
         w->RxLen[idx] = (USHORT)Len;
         w->RxHead++;

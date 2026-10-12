@@ -89,7 +89,7 @@
 #define SCAN_PASSIVE_MS     300
 #define SCAN_ACTIVE_MS      75
 #define SCAN_DIRECTED_MS    100
-#define TXQ_N               256
+#define TXQ_N               1024
 #define TXA_N               8
 #define TXA_BUF             12288
 #define TXQ_BUF             1600

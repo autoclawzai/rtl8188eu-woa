@@ -17,6 +17,8 @@ if (-not $adm) {
 
 $repo = "autoclawzai/rtl8188eu-woa"
 $root = Join-Path $env:USERPROFILE "Downloads\rtl8188eu"
+New-Item -ItemType Directory -Force $root | Out-Null
+try { Start-Transcript -Path (Join-Path $root "update.log") -Force | Out-Null } catch {}   # SSH drop ho to bhi log bachta hai
 $dist = Join-Path $root "dist"
 New-Item -ItemType Directory -Force $root | Out-Null
 Write-Host "== 1/5 download ==" -ForegroundColor Cyan
@@ -77,4 +79,5 @@ if ($Test -ne "none") {
   $t = Join-Path $root "test_$Test.ps1"
   if (Test-Path $t) { Push-Location $root; & $t -Ssid $Ssid; Pop-Location } else { Write-Host "test_$Test.ps1 nahi mila" -ForegroundColor Red }
 }
+try { Stop-Transcript | Out-Null } catch {}
 Write-Host "Done. Result txt Desktop pe hai (ampdu/pipe/speed/qos/ht40/dlcpu .txt)." -ForegroundColor Green

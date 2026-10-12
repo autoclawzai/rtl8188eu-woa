@@ -1,8 +1,8 @@
 # One-shot: latest build + test scripts download -> Downloads\rtl8188eu, driver install, test run.
 # Usage (any PowerShell):
 #   iwr -useb https://raw.githubusercontent.com/autoclawzai/rtl8188eu-woa/main/update.ps1 -OutFile "$env:USERPROFILE\Downloads\update.ps1"; powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\Downloads\update.ps1"
-# Optional: -Test pipe|speed|qos|ht40|dlcpu|agg|reconnect|none   -Ssid "Airtel_Thanks"
-param([string]$Test = "pipe", [string]$Ssid = "Airtel_Thanks")
+# Optional: -Test ampdu|pipe|speed|qos|ht40|dlcpu|agg|reconnect|none   -Ssid "Airtel_Thanks"
+param([string]$Test = "ampdu", [string]$Ssid = "Airtel_Thanks")
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -22,7 +22,7 @@ New-Item -ItemType Directory -Force $root | Out-Null
 Write-Host "== 1/5 download ==" -ForegroundColor Cyan
 $zip = Join-Path $root "rtl8188eu-dist.zip"
 Invoke-WebRequest "https://github.com/$repo/releases/download/latest/rtl8188eu-dist.zip" -OutFile $zip -UseBasicParsing
-foreach ($f in "test_pipe","test_speed","test_qos","test_ht40","test_dlcpu","test_agg","test_reconnect") {
+foreach ($f in "test_ampdu","test_pipe","test_speed","test_qos","test_ht40","test_dlcpu","test_agg","test_reconnect") {
   Invoke-WebRequest "https://raw.githubusercontent.com/$repo/main/$f.ps1" -OutFile (Join-Path $root "$f.ps1") -UseBasicParsing
 }
 Write-Host "== 2/5 extract ==" -ForegroundColor Cyan
@@ -77,4 +77,4 @@ if ($Test -ne "none") {
   $t = Join-Path $root "test_$Test.ps1"
   if (Test-Path $t) { Push-Location $root; & $t -Ssid $Ssid; Pop-Location } else { Write-Host "test_$Test.ps1 nahi mila" -ForegroundColor Red }
 }
-Write-Host "Done. Result txt Desktop pe hai (pipe/speed/qos/ht40/dlcpu .txt)." -ForegroundColor Green
+Write-Host "Done. Result txt Desktop pe hai (ampdu/pipe/speed/qos/ht40/dlcpu .txt)." -ForegroundColor Green

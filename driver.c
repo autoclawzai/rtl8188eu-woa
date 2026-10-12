@@ -195,6 +195,9 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinSsidLen;
     UCHAR           JoinCh;
     volatile LONG   TxSemBlocked, TxWorkRuns, TxQMax;   /* TX pipeline diagnostics: all 8 USB slots busy / worker wakeups / max queued frames */
+    ULONG           AmpduCfg;                /* Cfg_TxAmpdu: we send ADDBA request (TID0) like the real driver, then AGG_EN */
+    volatile LONG   TxAmpdu, TxSeqData, TxBaTries;   /* TxAmpdu: 0 off, 1 requested, 2 active */
+    UCHAR           TxBaToken;
     ULONG           QosTx;                   /* Cfg_QosTx: convert Windows' plain data frames to QoS data (TID 0) like the real driver */
     UCHAR           TxQosTmp[TXQ_BUF + 4];
     ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
@@ -1312,7 +1315,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     }
     pipe = (mgmt || useMgmtPipe) ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
     if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
-    if (!mgmt && c->QosTx && frame[0] == 0x08 && (frame[1] & 3) == 1 && fl >= 32 && fl + 2 <= TXQ_BUF &&
+    if (!mgmt && (c->QosTx || c->TxAmpdu == 2) && frame[0] == 0x08 && (frame[1] & 3) == 1 && fl >= 32 && fl + 2 <= TXQ_BUF &&
         !(frame[30] == 0x88 && frame[31] == 0x8E)) {          /* plain ToDS data (not EAPOL) -> QoS data, TID 0: the real driver always sends QoS */
         RtlCopyMemory(c->TxQosTmp, frame, 24);
         c->TxQosTmp[0] = 0x88; c->TxQosTmp[24] = 0; c->TxQosTmp[25] = 0;
@@ -1334,7 +1337,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         WdfWaitLockAcquire(c->TxLock, NULL);
     }
     if (real && (dm & 1)) { hdr = TXDESC_LEN + 16; f = b + hdr; }
-    seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
+    seq = (ULONG)InterlockedIncrement(mgmt ? (volatile LONG *)&c->TxSeq : &c->TxSeqData) & 0xFFF;
     {
         /* WPA2: protect unicast/ToDS data frames (not EAPOL) with CCMP. We add the 8 byte CCMP header,
          * the hardware encrypts and appends the MIC (length in the descriptor excludes the MIC). */
@@ -1375,6 +1378,7 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         if ((dm & 8) && rate >= 12) w[5] |= 0x40u;                         /* SGI for MCS rates */
         if (dm & 16) { w[6] = 0x6666F800u; w[7] = 0; }                     /* rate fallback table */
     }
+    if (!mgmt && mode == 0 && c->TxAmpdu == 2 && qos) w[2] = 0x00701000u;     /* BA agreement exists: let the hardware build A-MPDUs (AGG_EN + density 7) */
     for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
     w[7] |= ck;
     RtlCopyMemory(b, w, TXDESC_LEN);
@@ -1734,15 +1738,16 @@ static NTSTATUS Join_HwUp(PDEVICE_CONTEXT c)
     (VOID)Rtl_Write32(c, 0x0508, 0x0000A42Bu);                   /* EDCA BE */
     (VOID)Rtl_Write32(c, 0x050C, 0x0000A44Fu);                   /* EDCA BK */
     (VOID)Rtl_Write8(c, 0x0458, 0x41);
-    (VOID)Rtl_Write8(c, 0x0459, 0xA8);
+    (VOID)Rtl_Write8(c, 0x0459, c->AmpduCfg ? 0x77 : 0xA8);
     (VOID)Rtl_Write8(c, 0x045A, 0x72);
-    (VOID)Rtl_Write8(c, 0x045B, 0xB9);
+    (VOID)Rtl_Write8(c, 0x045B, c->AmpduCfg ? 0x77 : 0xB9);
     (VOID)Rtl_Write8(c, 0x045C, 0x04);
     return STATUS_SUCCESS;
 }
 
 static VOID Join_HwDown(PDEVICE_CONTEXT c)
 {
+    InterlockedExchange(&c->TxAmpdu, 0);
     InterlockedExchange(&c->Bw40Want, 0);
     if (c->Bw40Active) (VOID)Rtl_Bw20Restore(c);
     Sec_Reset(c);
@@ -1818,6 +1823,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
     c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     c->RxNativeMode = RegGetUlong(dev, L"Cfg_RxNative", 1);
+    c->AmpduCfg = RegGetUlong(dev, L"Cfg_TxAmpdu", 1); InterlockedExchange(&c->TxAmpdu, 0); c->TxBaTries = 0;
     c->BaEnable = RegGetUlong(dev, L"Cfg_Ba", 1); c->BaReq = c->BaResp = 0; c->BaQTail = c->BaQHead;
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
@@ -2006,6 +2012,12 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     RegLog(dev, L"Log_Rate_PickMcs4", c->PickN[1]);
     RegLog(dev, L"Log_Rate_Pick24M", c->PickN[2]);
     RegLog(dev, L"Log_Rate_Pick11M", c->PickN[3]);
+    if (c->AmpduCfg && c->JoinState == JOIN_UP && c->HwReady && c->TxAmpdu != 2 && c->DataTxOk >= 100 && c->TxBaTries < 4) {
+        c->TxAmpdu = 1; c->TxBaTries++;
+        Ba_SendAddbaReq(c);
+    }
+    RegLog(dev, L"Log_TxAmpdu_State", (ULONG)c->TxAmpdu);
+    RegLog(dev, L"Log_TxAmpdu_Tries", (ULONG)c->TxBaTries);
     LogDataStats(dev, c);
     if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
 }
@@ -2033,6 +2045,20 @@ static VOID EvtBaWork(WDFWORKITEM wi)
         (VOID)Tx_Raw(c, f, sizeof(f), TRUE, FALSE);
         c->BaResp++;
     }
+}
+
+/* TX-direction Block-Ack: the real Realtek driver sends an ADDBA request for TID 0 once traffic flows; the AP's
+ * response (status 0) lets the hardware aggregate our frames into A-MPDUs (capture: request at t=6.73s, response 10 ms later). */
+static VOID Ba_SendAddbaReq(PDEVICE_CONTEXT c)
+{
+    UCHAR f[24 + 9];
+    ULONG ssn = ((ULONG)c->TxSeqData + 1) & 0xFFF, ssc = ssn << 4;
+    Mgmt_Header(c, f, 0xD0);
+    f[24] = 3; f[25] = 0; f[26] = ++c->TxBaToken; if (!f[26]) f[26] = ++c->TxBaToken;   /* BlockAck / ADDBA request */
+    f[27] = 0x02; f[28] = 0x10;                      /* immediate BA, TID 0, buffer 64 */
+    f[29] = 0; f[30] = 0;                            /* timeout 0 */
+    f[31] = (UCHAR)ssc; f[32] = (UCHAR)(ssc >> 8);   /* starting sequence number */
+    (VOID)Tx_Raw(c, f, sizeof(f), TRUE, FALSE);
 }
 
 static VOID EvtLossWork(WDFWORKITEM wi)
@@ -2152,6 +2178,10 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
                 WdfSpinLockRelease(c->TxQLock);
                 WdfWorkItemEnqueue(c->BaWork);
             } else WdfSpinLockRelease(c->TxQLock);
+        } else if (sub == 13 && state == JOIN_UP && len >= 24 + 9 && f[24] == 3 && f[25] == 1) {   /* ADDBA response to OUR request */
+            if (c->TxAmpdu == 1 && f[26] == c->TxBaToken && Le16(f + 27) == 0 && (((f[29] >> 2) & 0xF) == 0)) c->TxAmpdu = 2;
+        } else if (sub == 13 && state == JOIN_UP && len >= 24 + 4 && f[24] == 3 && f[25] == 2) {   /* DELBA */
+            if (c->TxAmpdu == 2 && (((f[27] >> 4) & 0xF) == 0) && !(f[27] & 0x08)) c->TxAmpdu = 0;
         } else if ((sub == 12 || sub == 10) && state == JOIN_UP && len >= 26) {
             c->LossReason = Le16(f + 24);
             if (InterlockedCompareExchange(&c->JoinState, JOIN_IDLE, JOIN_UP) == JOIN_UP)

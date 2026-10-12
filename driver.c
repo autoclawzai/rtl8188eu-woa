@@ -1809,7 +1809,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->BaEnable = RegGetUlong(dev, L"Cfg_Ba", 1); c->BaReq = c->BaResp = 0; c->BaQTail = c->BaQHead;
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
-    c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x0C);
+    c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x1C);
     InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;

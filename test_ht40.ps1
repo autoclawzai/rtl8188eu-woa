@@ -35,5 +35,5 @@ foreach ($v in $variants) {
   (Get-ItemProperty $k | Select-Object Log_Ht40_ApSec,Log_Ht40_Status,Log_Join_Status,Log_Join_AuthTries,Log_Join_AssocTries,Log_Ba_Req,Log_Ba_Resp,Log_Data_TxOk,Log_Data_TxFail,Log_Rate_PickMcs7) | Format-List | Out-File $o -Append
 }
 Set-ItemProperty $k -Name Cfg_Ht40 -Value 1 -Type DWord
-Set-ItemProperty $k -Name Cfg_DescMask -Value 12 -Type DWord
-"Done -> $o  (defaults: Ht40=1, DescMask=12)"
+Set-ItemProperty $k -Name Cfg_DescMask -Value 28 -Type DWord
+"Done -> $o  (defaults: Ht40=1, DescMask=28)"

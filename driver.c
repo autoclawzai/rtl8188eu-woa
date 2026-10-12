@@ -194,7 +194,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinSsid[32];
     UCHAR           JoinSsidLen;
     UCHAR           JoinCh;
-    ULONG           Ht40Cfg, DescMode;       /* Cfg_Ht40 (0/1), Cfg_DescMode (0 = old descriptor, 1 = real Realtek style) */
+    ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
     volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
     UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
     UCHAR           JoinExtIe[256];
@@ -1295,7 +1295,8 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     NTSTATUS st;
     TXSLOT *slot = NULL;
     ULONG hdr = TXDESC_LEN;                          /* descriptor + optional 16 byte pad (real Realtek layout) */
-    BOOLEAN real = (BOOLEAN)(!mgmt && c->DescMode == 1 && mode == 0);
+    BOOLEAN real = (BOOLEAN)(!mgmt && c->DescMask != 0 && mode == 0);
+    ULONG dm = c->DescMask;
 
     switch (mode) {
     case 1: queue = 0x12; useMgmtPipe = TRUE; break;      /* data frames through the MGNT queue / ep 0x02 */
@@ -1316,11 +1317,11 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         for (k = 0; k < TXA_N; k++)
             if (InterlockedCompareExchange(&c->TxSlot[k].InUse, 1, 0) == 0) { slot = &c->TxSlot[k]; break; }
         if (!slot) { KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE); return STATUS_DEVICE_BUSY; }
-        b = slot->Buf; f = b + (real ? TXDESC_LEN + 16 : TXDESC_LEN);
+        b = slot->Buf; f = b + ((real && (c->DescMask & 1)) ? TXDESC_LEN + 16 : TXDESC_LEN);
     } else {
         WdfWaitLockAcquire(c->TxLock, NULL);
     }
-    if (real) { hdr = TXDESC_LEN + 16; f = b + hdr; }
+    if (real && (dm & 1)) { hdr = TXDESC_LEN + 16; f = b + hdr; }
     seq = (ULONG)InterlockedIncrement((volatile LONG *)&c->TxSeq) & 0xFFF;
     {
         /* WPA2: protect unicast/ToDS data frames (not EAPOL) with CCMP. We add the 8 byte CCMP header,
@@ -1354,15 +1355,13 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     w[5] = mgmt ? 0x001A0000u : (queue == 0x12 ? (0x001A0000u | rate) : (0x0001FF00u | rate));
     w[6] = 0;
     w[7] = 0x20000000u;
-    if (real) {   /* layout of the data descriptors seen from the real Realtek driver (usb capture) */
-        w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
-        w[1] = 0x08000000u | (queue << 8) | (enc ? 0x00C00000u : 0);
-        w[2] = 0x00701000u;                                   /* AGG_EN + AMPDU density 7, no AGG_BREAK / antenna bits */
-        w[4] = c->Bw40Active ? 0x02000908u : 0x00000908u;     /* RTS rate 24M, CTS-self, DATA_BW */
-        w[5] = 0x0001FF00u | rate | (rate >= 12 ? 0x40u : 0); /* SGI for MCS rates */
-        w[6] = 0x6666F800u;                                   /* rate fallback table */
-        w[7] = 0;
-        RtlZeroMemory(b + TXDESC_LEN, 16);
+    if (real) {   /* pieces of the data descriptor seen from the real Realtek driver, selectable via Cfg_DescMask */
+        if (dm & 1)  { w[1] |= 0x08000000u; RtlZeroMemory(b + TXDESC_LEN, 16); }
+        if (dm & 2)  w[2] = 0x00701000u;                                   /* AGG_EN + AMPDU density 7, no AGG_BREAK / antenna bits */
+        if ((dm & 4) && c->Bw40Active) w[4] |= 0x02000000u;                /* DATA_BW 40 */
+        if (dm & 32) w[4] = 0x00000908u | (c->Bw40Active && (dm & 4) ? 0x02000000u : 0);   /* RTS rate 24M, CTS-self */
+        if ((dm & 8) && rate >= 12) w[5] |= 0x40u;                         /* SGI for MCS rates */
+        if (dm & 16) { w[6] = 0x6666F800u; w[7] = 0; }                     /* rate fallback table */
     }
     for (i = 0; i < 8; i++) ck ^= (USHORT)(w[i] & 0xFFFF) ^ (USHORT)(w[i] >> 16);
     w[7] |= ck;
@@ -1810,7 +1809,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->BaEnable = RegGetUlong(dev, L"Cfg_Ba", 1); c->BaReq = c->BaResp = 0; c->BaQTail = c->BaQHead;
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
-    c->DescMode = RegGetUlong(dev, L"Cfg_DescMode", 1);
+    c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x0C);
     InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;

@@ -1995,6 +1995,7 @@ VOID EvtStatsTimer(WDFTIMER timer)
     WdfWorkItemEnqueue(c->StatsWork);
 }
 
+static VOID Ba_SendAddbaReq(PDEVICE_CONTEXT c);
 static VOID EvtStatsWork(WDFWORKITEM wi)
 {
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);

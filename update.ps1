@@ -33,6 +33,14 @@ Get-ChildItem $dist | ForEach-Object { Write-Host ("  {0} {1}" -f $_.Name, $_.Le
 if (-not ((bcdedit /enum) -match 'testsigning\s+Yes')) { Write-Host "WARNING: test signing ON nahi hai. 'bcdedit /set testsigning on' karke reboot karo." -ForegroundColor Red }
 
 Write-Host "== 3/5 purana driver hatao + certificate ==" -ForegroundColor Cyan
+# driver uninstall interface delete karta hai -> Windows WiFi profiles (password) bhi chali jaati hain. Pehle backup, baad me restore.
+$prof = Join-Path $root "profiles"
+if (Test-Path $prof) { Remove-Item $prof -Recurse -Force }
+New-Item -ItemType Directory -Force $prof | Out-Null
+foreach ($l in (netsh wlan show profiles)) {
+  if ($l -match 'All User Profile\s*:\s*(.+)$' -or $l -match 'Profile\s*:\s*(.+)$') { $pn = $Matches[1].Trim(); netsh wlan export profile name="$pn" key=clear folder="$prof" | Out-Null }
+}
+Write-Host ("  {0} WiFi profile backup" -f @(Get-ChildItem $prof -Filter *.xml).Count)
 $cur = $null
 foreach ($l in (pnputil /enum-drivers)) {
   if ($l -match 'Published Name\s*:\s*(oem\d+\.inf)') { $cur = $Matches[1] }
@@ -53,6 +61,9 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 if (-not $ok) { Write-Host "Device OK state me nahi aaya. Adapter nikaal ke dobara lagao, phir script chalao." -ForegroundColor Red; return }
 Write-Host "  adapter OK. WiFi connect ka wait..."
+foreach ($x in (Get-ChildItem $prof -Filter *.xml -ErrorAction SilentlyContinue)) { netsh wlan add profile filename="$($x.FullName)" | Out-Null }
+Remove-Item $prof -Recurse -Force -ErrorAction SilentlyContinue      # clear-text password files hata do
+netsh wlan connect name="$Ssid" | Out-Null
 netsh wlan set profileparameter name="$Ssid" connectionmode=auto 2>$null | Out-Null
 for ($i = 0; $i -lt 25; $i++) {
   Start-Sleep 3

@@ -1822,7 +1822,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
     c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x1C);
-    c->QosTx = RegGetUlong(dev, L"Cfg_QosTx", 1);
+    c->QosTx = RegGetUlong(dev, L"Cfg_QosTx", 0);
     InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;

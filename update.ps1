@@ -9,6 +9,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 # admin needed (driver install) -> relaunch elevated
 $adm = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $adm -and $env:SSH_CONNECTION) { Write-Host "SSH session admin nahi hai. Administrator account se ssh karo (administrators group ka user)." -ForegroundColor Red; return }
 if (-not $adm) {
   Write-Host "Admin rights chahiye, dobara admin me khol raha hu..." -ForegroundColor Yellow
   Start-Process powershell -Verb RunAs -ArgumentList "-NoExit -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Test $Test -Ssid `"$Ssid`""
@@ -77,6 +78,7 @@ for ($i = 0; $i -lt 25; $i++) {
 Start-Sleep 5
 
 Write-Host "== 5/5 test: $Test ==" -ForegroundColor Cyan
+$t0 = Get-Date
 if ($Test -ne "none") {
   $t = Join-Path $root "test_$Test.ps1"
   if (Test-Path $t) { Push-Location $root; & $t -Ssid $Ssid; Pop-Location } else { Write-Host "test_$Test.ps1 nahi mila" -ForegroundColor Red }
@@ -84,5 +86,10 @@ if ($Test -ne "none") {
 try { Stop-Transcript | Out-Null } catch {}
 $res = Join-Path $env:USERPROFILE "Desktop\$Test.txt"
 if (Test-Path $res) { Write-Host "== $res ==" -ForegroundColor Cyan; Get-Content $res }
+# result txt ko yahin print karo (SSH/Termux se seedha copy kar sakte ho)
+Get-ChildItem "$env:USERPROFILE\Desktop\*.txt" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $t0 } | Sort-Object LastWriteTime | ForEach-Object {
+  Write-Host ("`n######## {0} ########" -f $_.Name) -ForegroundColor Yellow
+  Get-Content $_.FullName
+}
 Write-Host "Done. Result txt Desktop pe hai (ampdu/pipe/speed/qos/ht40/dlcpu .txt)." -ForegroundColor Green
 try { Stop-Transcript | Out-Null } catch {}

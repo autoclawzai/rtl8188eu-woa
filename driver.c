@@ -194,6 +194,8 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinSsid[32];
     UCHAR           JoinSsidLen;
     UCHAR           JoinCh;
+    ULONG           QosTx;                   /* Cfg_QosTx: convert Windows' plain data frames to QoS data (TID 0) like the real driver */
+    UCHAR           TxQosTmp[TXQ_BUF + 4];
     ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
     volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
     UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
@@ -1309,6 +1311,13 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     }
     pipe = (mgmt || useMgmtPipe) ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
     if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
+    if (!mgmt && c->QosTx && frame[0] == 0x08 && (frame[1] & 3) == 1 && fl >= 32 && fl + 2 <= TXQ_BUF &&
+        !(frame[30] == 0x88 && frame[31] == 0x8E)) {          /* plain ToDS data (not EAPOL) -> QoS data, TID 0: the real driver always sends QoS */
+        RtlCopyMemory(c->TxQosTmp, frame, 24);
+        c->TxQosTmp[0] = 0x88; c->TxQosTmp[24] = 0; c->TxQosTmp[25] = 0;
+        RtlCopyMemory(c->TxQosTmp + 26, frame + 24, fl - 24);
+        frame = c->TxQosTmp; fl += 2; qos = TRUE;
+    }
 
     if (!mgmt && mode == 0 && c->TxAsyncOk) {      /* pipelined data TX: take a free slot */
         LARGE_INTEGER to; ULONG k;
@@ -1810,6 +1819,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
     c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x1C);
+    c->QosTx = RegGetUlong(dev, L"Cfg_QosTx", 1);
     InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);
     if (!NT_SUCCESS(st)) return st;

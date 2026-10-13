@@ -1845,28 +1845,28 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
 
     /* --- authentication --- */
     c->JoinStatus = 0xFFFF;
-    for (tries = 0; tries < 4; tries++) {
+    for (tries = 0; tries < 8; tries++) {
         KeClearEvent(&c->JoinEvent);
         InterlockedExchange(&c->JoinState, JOIN_AUTH);
         (VOID)Join_SendAuth(c);
         if (Join_Wait(c, 150) == STATUS_SUCCESS) break;
     }
     RegLog(dev, L"Log_Join_AuthTries", tries + 1);
-    if (tries == 4) return STATUS_IO_TIMEOUT;
+    if (tries == 8) return STATUS_IO_TIMEOUT;
     RegLog(dev, L"Log_Join_AuthStatus", c->JoinStatus);
     if (c->JoinStatus != 0) return STATUS_ACCESS_DENIED;
 
     /* --- association --- */
     n = Join_BuildAssocReq(c, req);
     c->JoinStatus = 0xFFFF;
-    for (tries = 0; tries < 4; tries++) {
+    for (tries = 0; tries < 6; tries++) {
         KeClearEvent(&c->JoinEvent);
         InterlockedExchange(&c->JoinState, JOIN_ASSOC);
         (VOID)Tx_Raw(c, req, n, TRUE, FALSE);
         if (Join_Wait(c, 300) == STATUS_SUCCESS) break;
     }
     RegLog(dev, L"Log_Join_AssocTries", tries + 1);
-    if (tries == 4) return STATUS_IO_TIMEOUT;
+    if (tries == 6) return STATUS_IO_TIMEOUT;
     RegLog(dev, L"Log_Join_AssocStatus", c->JoinStatus);
     if (c->JoinStatus != 0) return STATUS_ACCESS_DENIED;
 
@@ -2293,7 +2293,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
 
 ULONG Rtl_CfgLinkState(WDFDEVICE dev)
 {
-    return RegGetUlong(dev, L"Cfg_LinkState", 0);
+    return RegGetUlong(dev, L"Cfg_LinkState", 1);
 }
 
 VOID Rtl_WifiDisconnect(WDFDEVICE dev)

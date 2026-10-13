@@ -15,7 +15,7 @@ function Decode($ki) {
 }
 $rows = @()
 $n = [int]$p.Log_Eapol_N
-for ($q = 0; $q -lt [Math]::Min($n, 24); $q++) {
+for ($q = 0; $q -lt [Math]::Min($n, 128); $q++) {
   $t = $p.("Log_Eapol_T{0:00}" -f $q); $i = [uint32]$p.("Log_Eapol_I{0:00}" -f $q)
   if (-not $t) { continue }
   $wall = $now.AddMilliseconds(-($bootMs - $t))

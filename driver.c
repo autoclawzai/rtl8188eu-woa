@@ -201,7 +201,7 @@ typedef struct _DEVICE_CONTEXT {
     ULONG           QosTx;                   /* Cfg_QosTx: convert Windows' plain data frames to QoS data (TID 0) like the real driver */
     UCHAR           TxQosTmp[TXQ_BUF + 4];
     volatile LONG   EapolN; LONG EapolLogged; ULONG EapolT[24], EapolI[24];   /* EAPOL timeline: ms since boot / dir<<31 | keyinfo<<8 | replay counter low byte */
-    ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
+    ULONG           Ht40Cfg, DescMask, EapolLow;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
     volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
     UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
     UCHAR           JoinExtIe[256];

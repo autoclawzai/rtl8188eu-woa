@@ -35,6 +35,7 @@ VOID WifiCx_OnRxData(WDFDEVICE Device, const UCHAR *Da, const UCHAR *Sa, const U
 
 /* phase 5d: stats (wifi.cpp -> driver.c registry log): out[0..11] */
 VOID WifiCx_GetDataStats(WDFDEVICE Device, ULONG *Out, ULONG Count);
+VOID WifiCx_ResetRx(WDFDEVICE Device);
 VOID WifiCx_OnRxFrame(WDFDEVICE Device, const UCHAR *Frame, ULONG Len);   /* native 802.11 data frame (no FCS) */
 
 /* phase 5d: wifi.cpp -> driver.c */

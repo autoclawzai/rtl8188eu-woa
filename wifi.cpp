@@ -719,8 +719,18 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
 static VOID EvtRxNotify(NETPACKETQUEUE q, BOOLEAN enabled)
 {
     PQUEUE_CTX qc = GetQueueCtx(q);
-    InterlockedExchange(&qc->Wifi->RxNotifyArmed, enabled ? 1 : 0);
-    if (enabled) InterlockedIncrement(&g_St[ST_RX_ARM]);
+    PWIFI_CTX w = qc->Wifi;
+    KIRQL irql;
+    BOOLEAN kick = FALSE;
+    if (!enabled) { InterlockedExchange(&w->RxNotifyArmed, 0); return; }
+    InterlockedIncrement(&g_St[ST_RX_ARM]);
+    /* lost-wakeup guard: a frame may have arrived after the last drain but before the OS enabled
+     * notifications; arming now would leave it stuck until the next frame (delays EAPOL by up to seconds) */
+    KeAcquireSpinLock(&w->RxLock, &irql);
+    if (w->RxHead != w->RxTail) kick = TRUE;
+    else InterlockedExchange(&w->RxNotifyArmed, 1);
+    KeReleaseSpinLock(&w->RxLock, irql);
+    if (kick) { InterlockedIncrement(&g_St[ST_RX_NOTIFY]); NetRxQueueNotifyMoreReceivedPacketsAvailable(q); }
 }
 
 static VOID EvtRxCancel(NETPACKETQUEUE q)
@@ -825,6 +835,15 @@ extern "C" VOID WifiCx_OnRxFrame(WDFDEVICE Device, const UCHAR* Frame, ULONG Len
     }
     KeReleaseSpinLock(&w->RxLock, irql);
     if (q) { InterlockedIncrement(&g_St[ST_RX_NOTIFY]); NetRxQueueNotifyMoreReceivedPacketsAvailable(q); }
+}
+
+extern "C" VOID WifiCx_ResetRx(WDFDEVICE Device)
+{
+    PWIFI_CTX w = GetWifiCtx(Device);
+    KIRQL irql;
+    KeAcquireSpinLock(&w->RxLock, &irql);
+    w->RxTail = w->RxHead;
+    KeReleaseSpinLock(&w->RxLock, irql);
 }
 
 extern "C" VOID WifiCx_GetDataStats(WDFDEVICE Device, ULONG* Out, ULONG Count)

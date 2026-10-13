@@ -2239,6 +2239,8 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
             if (len < 28) return;
             c->DataRx++;
             c->RxNative++;
+            { ULONG h2 = (sub & 8) ? 26 : 24; if ((fl & 0x80) && (sub & 8)) h2 += 4;
+              if (len >= h2 + 8 + 17 + 4 && f[h2 + 6] == 0x88 && f[h2 + 7] == 0x8E) Eapol_Note(c, TRUE, f + h2 + 8); }
             WifiCx_OnRxFrame(c->Self, f, len - 4);
             return;
         }
@@ -2307,6 +2309,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     WdfSpinLockAcquire(c->TxQLock);
     c->TxQTail = c->TxQHead;                       /* drop anything stale */
     WdfSpinLockRelease(c->TxQLock);
+    WifiCx_ResetRx(dev);                           /* no stale frames from the previous session */
     c->JoinJob = JOB_JOIN;
     WdfWorkItemEnqueue(c->JoinWork);
     return STATUS_SUCCESS;

@@ -2036,7 +2036,7 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
     RegLog(dev, L"Log_TxAmpdu_State", (ULONG)c->TxAmpdu);
     RegLog(dev, L"Log_TxAmpdu_Tries", (ULONG)c->TxBaTries);
     LogDataStats(dev, c);
-    if (c->JoinState == JOIN_UP && c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
+    if (c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(c->JoinState == JOIN_UP ? 2000 : 3000));
 }
 
 /* AP asks for a Block-Ack agreement (RX direction): accept it so the AP sends A-MPDUs. The hardware

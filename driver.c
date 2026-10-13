@@ -200,6 +200,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           TxBaToken;
     ULONG           QosTx;                   /* Cfg_QosTx: convert Windows' plain data frames to QoS data (TID 0) like the real driver */
     UCHAR           TxQosTmp[TXQ_BUF + 4];
+    volatile LONG   EapolN; LONG EapolLogged; ULONG EapolT[24], EapolI[24];   /* EAPOL timeline: ms since boot / dir<<31 | keyinfo<<8 | replay counter low byte */
     ULONG           Ht40Cfg, DescMask;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
     volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
     UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
@@ -1926,6 +1927,16 @@ static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
     WifiCx_GetDataStats(dev, st, 18);
     for (i = 0; i < 18; i++) RegLog(dev, nm[i], st[i]);
     RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
+    if (c->EapolLogged != c->EapolN) {
+        ULONG q, cnt = (ULONG)c->EapolN;
+        WCHAR nm[40];
+        c->EapolLogged = c->EapolN;
+        RegLog(dev, L"Log_Eapol_N", cnt);
+        for (q = 0; q < 24 && q < cnt; q++) {
+            RtlStringCbPrintfW(nm, sizeof(nm), L"Log_Eapol_T%02u", q); RegLog(dev, nm, c->EapolT[q]);
+            RtlStringCbPrintfW(nm, sizeof(nm), L"Log_Eapol_I%02u", q); RegLog(dev, nm, c->EapolI[q]);
+        }
+    }
     RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
     RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
     RegLog(dev, L"Log_Data_Rx", c->DataRx);
@@ -2130,6 +2141,15 @@ static VOID EvtTxWork(WDFWORKITEM wi)
 
 /* ---- RX: management responses + data -> Ethernet ---- */
 
+/* EAPOL timeline for slow-connect analysis. x = 802.1X header (version byte), >= 17 bytes available */
+static VOID Eapol_Note(PDEVICE_CONTEXT c, BOOLEAN rx, const UCHAR *x)
+{
+    LONG n = InterlockedIncrement(&c->EapolN) - 1;
+    ULONG ki = (x[1] == 3) ? (((ULONG)x[5] << 8) | x[6]) : 0xFFFFu;
+    c->EapolT[n % 24] = (ULONG)(KeQueryInterruptTime() / 10000);
+    c->EapolI[n % 24] = (rx ? 0x80000000u : 0) | (ki << 8) | x[16];
+}
+
 static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
 {
     UCHAR type, sub, fl;
@@ -2235,6 +2255,7 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
         llc = f + hdr;
         if (llc[0] != 0xAA || llc[1] != 0xAA || llc[2] != 0x03 || llc[3] != 0 || llc[4] != 0) { c->RxFlt[5]++; return; }
         c->DataRx++;
+        if (llc[6] == 0x88 && llc[7] == 0x8E && end - hdr >= 25) Eapol_Note(c, TRUE, llc + 8);
         WifiCx_OnRxData(c->Self, f + 4, f + 16, llc + 6, f + hdr + 8, end - hdr - 8);
     }
 }
@@ -2345,6 +2366,7 @@ NTSTATUS Rtl_TxEthernet(WDFDEVICE dev, const UCHAR *eth, ULONG len)
     }
     }
     c->TxAll++;
+    if (fl >= 49 && f[30] == 0x88 && f[31] == 0x8E) Eapol_Note(c, FALSE, f + 32);
     {
         ULONG cls = 4, ms = (ULONG)(KeQueryInterruptTime() / 10000 - c->UpMs);
         if (fl > 32) {

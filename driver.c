@@ -1362,6 +1362,10 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     }
     f[22] = (UCHAR)((seq << 4) & 0xFF);
     f[23] = (UCHAR)((seq << 4) >> 8);
+    if (!mgmt && c->EapolLow && !enc && fl >= 34 && (frame[0] & 0x0C) == 0x08) {   /* EAPOL: plain basic rate, no BW40/SGI/AGG/fallback */
+        ULONG eh = (frame[0] & 0x80) ? 26 : 24;
+        if (fl >= eh + 8 && frame[eh + 6] == 0x88 && frame[eh + 7] == 0x8E) { rate = 4; real = FALSE; }
+    }
 
     w[0] = 0x8C200000u | (bmc ? 0x01000000u : 0) | fl;
     w[1] = (mgmt ? 0x00001200u : (queue << 8)) | (enc ? 0x00C00000u : 0);
@@ -1829,6 +1833,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     Join_StopScan(c);
     c->Ht40Cfg = RegGetUlong(dev, L"Cfg_Ht40", 1);
     c->DescMask = RegGetUlong(dev, L"Cfg_DescMask", 0x1C);
+    c->EapolLow = RegGetUlong(dev, L"Cfg_EapolLow", 1);
     c->QosTx = RegGetUlong(dev, L"Cfg_QosTx", 0);
     InterlockedExchange(&c->Bw40Want, 0);
     st = ScanHop(c, c->JoinCh, TRUE);

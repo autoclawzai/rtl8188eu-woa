@@ -105,7 +105,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(QUEUE_CTX, GetQueueCtx)
 static WDFDEVICE g_WifiDevice;     /* one adapter per driver instance */
 /* data-path debug counters (logged from driver.c every 2 s while connected) */
 enum { ST_TXQ_CREATED, ST_RXQ_CREATED, ST_TX_ADV, ST_TX_PKT, ST_TX_SUBMIT_OK, ST_TX_SUBMIT_FAIL, ST_TX_LASTST,
-       ST_RX_ADV, ST_RX_ARM, ST_RX_IND, ST_RX_DROP, ST_RX_NOTIFY, ST_TX_L2, ST_TX_L2HDR, ST_TX_L3, ST_N };
+       ST_RX_ADV, ST_RX_ARM, ST_RX_IND, ST_RX_DROP, ST_RX_NOTIFY, ST_TX_L2, ST_TX_L2HDR, ST_TX_L3, ST_TXQ_CANCEL, ST_RXQ_CANCEL, ST_LINK_SET, ST_N };
 static volatile LONG g_St[ST_N];
 static volatile LONG g_RxL2 = -1;   /* Layer2Type seen on TX packets; RX uses the same */
 static volatile LONG g_RxL2Hdr = 0;
@@ -469,6 +469,25 @@ extern "C" VOID WifiCx_OnScanComplete(WDFDEVICE Device)
 /* ------------------------------------------------------------------ */
 /* connect results / link events                                       */
 /* ------------------------------------------------------------------ */
+#ifndef NDIS_LINK_SPEED_UNKNOWN
+#define NDIS_LINK_SPEED_UNKNOWN ((ULONG64)(-1))
+#endif
+/* optional: mirror the connection state into the NetAdapter link state (Cfg_LinkState=1) */
+static VOID SetNetLink(WDFDEVICE Device, BOOLEAN up)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    if (!Rtl_CfgLinkState(Device)) return;
+    NETADAPTER ad = ctx->Adapters[0];
+    if (!ad) return;
+    NET_ADAPTER_LINK_STATE ls;
+    NET_ADAPTER_LINK_STATE_INIT(&ls, up ? 65000000ULL : NDIS_LINK_SPEED_UNKNOWN,
+                                up ? MediaConnectStateConnected : MediaConnectStateDisconnected,
+                                up ? MediaDuplexStateFull : MediaDuplexStateUnknown,
+                                NetAdapterPauseFunctionTypeUnsupported, NetAdapterAutoNegotiationFlagNone);
+    NetAdapterSetLinkState(ad, &ls);
+    InterlockedIncrement(&g_St[ST_LINK_SET]);
+}
+
 extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT StatusCode, USHORT Aid,
                                        const UCHAR* Bssid, const UCHAR* AssocReq, ULONG AssocReqLen,
                                        const UCHAR* AssocResp, ULONG AssocRespLen)
@@ -546,6 +565,7 @@ extern "C" VOID WifiCx_OnConnectResult(WDFDEVICE Device, NTSTATUS Status, USHORT
             SendIndication(Device, ctx->ConnHdr, WDI_INDICATION_LINK_STATE_CHANGE, 0, STATUS_SUCCESS, out2, cb2);
             FreeGenerated(out2);
         }
+        SetNetLink(Device, TRUE);
         ctx->Connected = TRUE;
     } else {
         UNREFERENCED_PARAMETER(StatusCode);
@@ -558,6 +578,7 @@ extern "C" VOID WifiCx_OnDisconnectDone(WDFDEVICE Device)
 {
     PWIFI_CTX ctx = GetWifiCtx(Device);
     ctx->Connected = FALSE;
+    SetNetLink(Device, FALSE);
     if (InterlockedCompareExchange(&ctx->DiscPending, 0, 1) == 1)
         SendM4(Device, WDI_INDICATION_DISCONNECT_COMPLETE, ctx->DiscHdr, STATUS_SUCCESS);
 }
@@ -567,6 +588,7 @@ extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
     PWIFI_CTX ctx = GetWifiCtx(Device);
     BOOLEAN was = ctx->Connected;
     ctx->Connected = FALSE;
+    SetNetLink(Device, FALSE);
     WLog(Device, L"Log_Wifi_LinkLost", Reason);
     if (!was) return;
     /* unsolicited disassociation indication: Windows leaves the connected state and may reconnect */
@@ -633,6 +655,7 @@ static VOID EvtTxAdvance(NETPACKETQUEUE q)
 static VOID EvtTxNotify(NETPACKETQUEUE, BOOLEAN) {}
 static VOID EvtTxCancel(NETPACKETQUEUE q)
 {
+    InterlockedIncrement(&g_St[ST_TXQ_CANCEL]);
     NET_RING_COLLECTION const* rings = NetTxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
     while (NetPacketIteratorHasAny(&pi)) {
@@ -702,6 +725,7 @@ static VOID EvtRxNotify(NETPACKETQUEUE q, BOOLEAN enabled)
 
 static VOID EvtRxCancel(NETPACKETQUEUE q)
 {
+    InterlockedIncrement(&g_St[ST_RXQ_CANCEL]);
     PQUEUE_CTX qc = GetQueueCtx(q);
     NET_RING_COLLECTION const* rings = NetRxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);

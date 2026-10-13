@@ -1918,13 +1918,13 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
 
 static VOID LogDataStats(WDFDEVICE dev, PDEVICE_CONTEXT c)
 {
-    ULONG st[15] = {0};
-    static const PCWSTR nm[15] = { L"Log_Dp_TxQCreated", L"Log_Dp_RxQCreated", L"Log_Dp_TxAdv", L"Log_Dp_TxPkt",
+    ULONG st[18] = {0};
+    static const PCWSTR nm[18] = { L"Log_Dp_TxQCreated", L"Log_Dp_RxQCreated", L"Log_Dp_TxAdv", L"Log_Dp_TxPkt",
         L"Log_Dp_TxSubmitOk", L"Log_Dp_TxSubmitFail", L"Log_Dp_TxLastSt", L"Log_Dp_RxAdv", L"Log_Dp_RxArm",
-        L"Log_Dp_RxInd", L"Log_Dp_RxRingDrop", L"Log_Dp_RxNotify", L"Log_Dp_TxL2Type", L"Log_Dp_TxL2HdrLen", L"Log_Dp_TxL3Type" };
+        L"Log_Dp_RxInd", L"Log_Dp_RxRingDrop", L"Log_Dp_RxNotify", L"Log_Dp_TxL2Type", L"Log_Dp_TxL2HdrLen", L"Log_Dp_TxL3Type", L"Log_Dp_TxQCancel", L"Log_Dp_RxQCancel", L"Log_Dp_LinkSet" };
     ULONG i;
-    WifiCx_GetDataStats(dev, st, 15);
-    for (i = 0; i < 15; i++) RegLog(dev, nm[i], st[i]);
+    WifiCx_GetDataStats(dev, st, 18);
+    for (i = 0; i < 18; i++) RegLog(dev, nm[i], st[i]);
     RegLog(dev, L"Log_Data_TxOk", c->DataTxOk);
     RegLog(dev, L"Log_Data_TxFail", c->DataTxFail);
     RegLog(dev, L"Log_Data_TxDrop", c->DataTxDrop);
@@ -2289,6 +2289,11 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     c->JoinJob = JOB_JOIN;
     WdfWorkItemEnqueue(c->JoinWork);
     return STATUS_SUCCESS;
+}
+
+ULONG Rtl_CfgLinkState(WDFDEVICE dev)
+{
+    return RegGetUlong(dev, L"Cfg_LinkState", 0);
 }
 
 VOID Rtl_WifiDisconnect(WDFDEVICE dev)

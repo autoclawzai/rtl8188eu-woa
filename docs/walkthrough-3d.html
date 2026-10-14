@@ -1,0 +1,489 @@
+<title>rtl8188eu-woa Walkthrough</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout concept: full-bleed 3D scene, camera flies slide to slide; a glass text panel sits beside the scene.
+   Dark-first: signal-teal accent on blue-black ink, coral only for what broke. */
+:root {
+  --bg: #0a1018; --fg: #e8eef6; --muted: #8fa0b5; --line: #26354a; --panel: rgba(10,16,24,.78);
+  --accent: #38e0c0; --warn: #ff7a63; --mesh: #5d7592; --dim: #3a4d66;
+  --c0: #6aa6ff; --c1: #b58cff; --c2: #38e0c0; --c3: #ffc857; --c4: #8fa0b5; --c5: #ff7a63;
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif; --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #eef2f6; --fg: #0d1826; --muted: #51627a; --line: #c5d0dd; --panel: rgba(238,242,246,.82);
+  --accent: #00816b; --warn: #d2432f; --mesh: #7d93ad; --dim: #b4c2d3;
+  --c0: #2a63c8; --c1: #7a4fd0; --c2: #00816b; --c3: #b9830a; --c4: #5d6f86; --c5: #d2432f; color-scheme: light; } }
+:root[data-theme="light"] {
+  --bg: #eef2f6; --fg: #0d1826; --muted: #51627a; --line: #c5d0dd; --panel: rgba(238,242,246,.82);
+  --accent: #00816b; --warn: #d2432f; --mesh: #7d93ad; --dim: #b4c2d3;
+  --c0: #2a63c8; --c1: #7a4fd0; --c2: #00816b; --c3: #b9830a; --c4: #5d6f86; --c5: #d2432f; color-scheme: light; }
+:root[data-theme="dark"] {
+  --bg: #0a1018; --fg: #e8eef6; --muted: #8fa0b5; --line: #26354a; --panel: rgba(10,16,24,.78);
+  --accent: #38e0c0; --warn: #ff7a63; --mesh: #5d7592; --dim: #3a4d66;
+  --c0: #6aa6ff; --c1: #b58cff; --c2: #38e0c0; --c3: #ffc857; --c4: #8fa0b5; --c5: #ff7a63; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 400 15px/1.55 var(--display); overflow: hidden; }
+#gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+#labels { position: fixed; inset: 0; pointer-events: none; overflow: hidden; }
+.lb { position: absolute; left: 0; top: 0; transform: translate(-50%, -50%); font: 600 12px/1 var(--mono); color: var(--fg);
+  white-space: nowrap; opacity: 0; transition: opacity .35s; text-shadow: 0 0 6px var(--bg), 0 0 2px var(--bg); }
+.lb.sm { font-weight: 400; font-size: 11px; color: var(--muted); }
+.lb.big { font: 800 15px/1 var(--display); }
+#ui { position: fixed; inset: 0; pointer-events: none;
+  padding: calc(16px + env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) calc(16px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
+#panel { pointer-events: auto; width: min(400px, 36vw); max-height: calc(100% - 78px); overflow-y: auto; padding: 22px 22px 20px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+.kick { margin: 0 0 10px; font: 600 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
+h1 { margin: 0 0 12px; font: 800 clamp(26px, 3.4vw, 38px)/1.04 var(--display); letter-spacing: -.02em; text-wrap: balance; }
+#body p { margin: 0 0 10px; color: var(--fg); max-width: 62ch; }
+#body p.m { color: var(--muted); font-size: 13.5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; padding: 0; list-style: none; }
+.chips li { font: 600 12px/1 var(--mono); padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.chips li b { color: var(--accent); font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 0; padding: 0; list-style: none; font: 400 11.5px/1.2 var(--mono); color: var(--muted); }
+.legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+#extra { margin-top: 12px; }
+.tg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.tg button { font: 600 12px/1 var(--mono); padding: 10px 12px; background: transparent; color: var(--muted); border: 0; cursor: pointer; }
+.tg button[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+#cap { margin: 10px 0 0; font-size: 13.5px; color: var(--muted); }
+#info { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); min-height: 60px; }
+#info h2 { margin: 0 0 4px; font: 600 13px/1.3 var(--mono); color: var(--accent); }
+#info p { margin: 0; font-size: 14px; }
+#info .hint { color: var(--muted); font-size: 13px; }
+#nav { pointer-events: auto; position: absolute; left: max(16px, env(safe-area-inset-left, 0px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+#nav button.nb { font: 600 13px/1 var(--mono); width: 44px; height: 44px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+#nav button.nb:hover { border-color: var(--accent); }
+#cnt { font: 600 12px/1 var(--mono); color: var(--muted); min-width: 56px; text-align: center; }
+#dots { display: flex; gap: 4px; }
+#dots button { width: 22px; height: 44px; padding: 0; border: 0; background: transparent; cursor: pointer; position: relative; }
+#dots button::after { content: ""; position: absolute; left: 4px; right: 4px; top: 20px; height: 4px; border-radius: 2px; background: var(--line); }
+#dots button[aria-current="true"]::after { background: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 760px) {
+  #panel { position: absolute; left: max(16px, env(safe-area-inset-left, 0px)); right: max(16px, env(safe-area-inset-right, 0px)); bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+    width: auto; max-height: 46%; padding: 16px; }
+  h1 { font-size: 24px; margin-bottom: 8px; }
+  #nav { right: max(16px, env(safe-area-inset-right, 0px)); justify-content: space-between; gap: 6px; }
+  #dots button { width: 14px; }
+  #dots button::after { left: 2px; right: 2px; }
+}
+</style>
+<canvas id="gl"></canvas>
+<div id="labels"></div>
+<div id="ui">
+  <aside id="panel" aria-live="polite">
+    <p class="kick" id="kick"></p><h1 id="ttl"></h1><div id="body"></div><div id="extra"></div><div id="info"></div>
+  </aside>
+  <nav id="nav" aria-label="Slides">
+    <button class="nb" id="prev" aria-label="Pichla slide">&larr;</button>
+    <span id="cnt"></span>
+    <button class="nb" id="next" aria-label="Agla slide">&rarr;</button>
+    <div id="dots"></div>
+  </nav>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function () {
+  var RM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var cv = document.getElementById('gl');
+  var renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  var scene = new THREE.Scene();
+  var camera = new THREE.PerspectiveCamera(42, 1, 0.1, 400);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+  var sun = new THREE.DirectionalLight(0xffffff, 0.9); sun.position.set(6, 12, 9); scene.add(sun);
+
+  /* ---------- theme-aware materials ---------- */
+  var reg = [];
+  function mat(role, o) {
+    var m = new THREE.MeshStandardMaterial(Object.assign({ roughness: 0.5, metalness: 0.15 }, o || {}));
+    reg.push({ m: m, role: role }); return m;
+  }
+  function lmat(role, op) { var m = new THREE.LineBasicMaterial({ transparent: true, opacity: op == null ? 0.7 : op }); reg.push({ m: m, role: role }); return m; }
+  function css(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  var ROLES = { mesh: '--mesh', accent: '--accent', warn: '--warn', dim: '--dim', fg: '--fg', c0: '--c0', c1: '--c1', c2: '--c2', c3: '--c3', c4: '--c4', c5: '--c5' };
+  function applyTheme() {
+    var bg = css('--bg');
+    renderer.setClearColor(new THREE.Color(bg), 1);
+    scene.fog = new THREE.Fog(new THREE.Color(bg), 28, 95);
+    reg.forEach(function (r) { r.m.color.set(css(ROLES[r.role])); });
+  }
+
+  /* ---------- helpers ---------- */
+  var labelHost = document.getElementById('labels');
+  var labels = [];
+  var tmpV = new THREE.Vector3();
+  function label(slide, text, target, dy, cls) {
+    var el = document.createElement('div'); el.className = 'lb' + (cls ? ' ' + cls : ''); el.textContent = text; labelHost.appendChild(el);
+    var L = { el: el, slide: slide, target: target, dy: dy || 0 }; labels.push(L); return L;
+  }
+  function box(w, h, d, role, o) { return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(role, o)); }
+  function edges(mesh, role, op) { var l = new THREE.LineSegments(new THREE.EdgesGeometry(mesh.geometry), lmat(role, op)); mesh.add(l); return l; }
+  function ease(x) { x = Math.max(0, Math.min(1, x)); return 1 - Math.pow(1 - x, 3); }
+
+  var slides = [], items = [];
+  function addItem(slideIdx, mesh, title, text) { mesh.userData.info = { t: title, x: text }; mesh.userData.slide = slideIdx; mesh.userData.base = mesh.scale.clone(); items.push(mesh); }
+
+  /* ---------- SLIDE 0: title ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group();
+    var d = box(2.6, 0.45, 1.1, 'mesh'); edges(d, 'fg', 0.5); g.add(d);
+    var port = box(0.7, 0.3, 0.7, 'accent'); port.position.set(-1.65, 0, 0); g.add(port);
+    var led = new THREE.Mesh(new THREE.SphereGeometry(0.09, 16, 12), mat('accent')); led.position.set(0.9, 0.26, 0); g.add(led);
+    var rings = [];
+    for (var k = 0; k < 6; k++) {
+      var m = lmat('accent', 0.6); var r = new THREE.Mesh(new THREE.TorusGeometry(1, 0.012, 8, 96), mat('accent', { transparent: true, opacity: 0.6 }));
+      r.rotation.y = Math.PI / 2; r.position.set(1.4, 0.1, 0); g.add(r); rings.push(r);
+    }
+    var pts = []; for (var s = 0; s < 260; s++) pts.push(new THREE.Vector3((Math.random() - 0.5) * 60, (Math.random() - 0.5) * 24, (Math.random() - 0.5) * 40 - 8));
+    var stars = new THREE.Points(new THREE.BufferGeometry().setFromPoints(pts), (function () { var p = new THREE.PointsMaterial({ size: 0.07, transparent: true, opacity: 0.7 }); reg.push({ m: p, role: 'mesh' }); return p; })());
+    g.add(stars);
+    return {
+      kick: 'rtl8188eu-woa', title: 'Ek USB Wi-Fi dongle, Windows ARM64 ka naya driver',
+      body: '<p>TP-Link TL-WN722N v3 (Realtek RTL8188EUS) ke liye native WiFiCx driver. Raspberry Pi 400 par test hua, GitHub Actions se build, ek command se install.</p><p class="m">Arrow keys ya neeche ke buttons se aage badho. Scene mein jo cheez dikhe use click karo.</p><ul class="chips"><li><b>9</b> din</li><li><b>131</b> commits</li><li><b>~7,400</b> lines</li><li><b>20</b> bugs</li></ul>',
+      cam: [4, 2.4, 9.5], tgt: [0.8, 0, 0], g: g,
+      update: function (t) { rings.forEach(function (r, k) { var p = ((t * 0.28 + k / 6) % 1); r.scale.setScalar(0.3 + p * 7); r.material.opacity = 0.65 * (1 - p); }); led.material.opacity = 1; g.rotation.y = Math.sin(t * 0.3) * 0.18; }
+    };
+  })(0));
+
+  /* ---------- SLIDE 1: results ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var bars = [];
+    var data = [
+      { x: -4.6, v: 38, n: 'Ours', r: 'accent', c: 'Download', i: 'Download ~37-39 Mbps, real Realtek driver 36.8 Mbps. Yaani is hardware par us driver ke barabar ya thoda upar.' },
+      { x: -3.2, v: 36.8, n: 'Realtek', r: 'dim', c: 'Download', i: 'Realtek ka vendor driver (x86 reference machine) download par 36.8 Mbps.' },
+      { x: 1.6, v: 36, n: 'Ours', r: 'accent', c: 'Upload', i: 'Upload ~35-37 Mbps. TX A-MPDU se 19-26 se yahan tak aaya. Bacha hua gap Pi CPU ke paas practical limit hai.' },
+      { x: 3.0, v: 46.7, n: 'Realtek', r: 'dim', c: 'Upload', i: 'Realtek vendor driver upload par 46.7 Mbps.' },
+      { x: 4.4, v: 41, n: 'Intel', r: 'dim', c: 'Upload', i: 'Intel adapter upload par 41 Mbps (reference).' }
+    ];
+    var fl = box(12, 0.1, 3.6, 'dim', { transparent: true, opacity: 0.5 }); fl.position.set(0, -0.05, 0); g.add(fl);
+    data.forEach(function (d, k) {
+      var h = d.v * 0.1; var b = box(1.0, h, 1.0, d.r); b.geometry.translate(0, h / 2, 0); b.position.set(d.x, 0, 0); edges(b, 'fg', 0.35); g.add(b);
+      bars.push(b); addItem(1, b, d.c + ': ' + d.n + ' ' + d.v + ' Mbps', d.i);
+      var v = new THREE.Object3D(); v.position.set(d.x, h + 0.45, 0); g.add(v); label(1, d.v + '', v, 0, 'big');
+      var nn = new THREE.Object3D(); nn.position.set(d.x, 0, 0.9); g.add(nn); label(1, d.n, nn, 0, 'sm');
+    });
+    var a = new THREE.Object3D(); a.position.set(-3.9, 0, 2.1); g.add(a); label(1, 'DOWNLOAD (Mbps)', a, 6, null);
+    var b2 = new THREE.Object3D(); b2.position.set(3.0, 0, 2.1); g.add(b2); label(1, 'UPLOAD (Mbps)', b2, 6, null);
+    return {
+      kick: 'Result', title: 'Download ~38, upload ~36 Mbps',
+      body: '<p>Connect, DHCP, internet, HT40 aur A-MPDU sab chalta hai. Download real Realtek driver se aage hai; upload ka gap ~9 Mbps hai.</p><p class="m">Bars par click karo.</p>',
+      cam: [0, 3.4, 15], tgt: [0, 2.2, 0], g: g,
+      update: function (t, te) { bars.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.12) / 0.9)); }); }
+    };
+  })(1));
+
+  /* ---------- SLIDE 2: architecture ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var packets = [];
+    var L = [
+      { y: 4.5, h: 0.7, r: 'c0', n: 'Windows: WLAN AutoConfig / WDI', t: 'Windows', x: 'Scan, connect, keys aur data ke commands WDI/TLV mein bhejta hai aur indications wapas leta hai.' },
+      { y: 3.0, h: 0.7, r: 'c1', n: 'wifi.cpp: WiFiCx (C++)', t: 'wifi.cpp', x: 'WDI handlers, NetAdapter, TX/RX packet queues, RX staging ring (512), association result aur link state indications.' },
+      { y: 1.7, h: 0.3, r: 'accent', n: 'wifi.h: the only contract', t: 'wifi.h', x: 'WifiCx_* aur Rtl_* calls. Dono layers ke beech ka akela rasta, isliye hardware code bina NetAdapter ke test ho paya.' },
+      { y: 0.4, h: 0.7, r: 'c2', n: 'driver.c: hardware core (C)', t: 'driver.c', x: 'USB I/O, EFUSE, firmware, join state machine, TX descriptors, RX parser, CCMP aur CAM keys, rate pick, ADDBA, link-loss, registry logs.' },
+      { y: -1.0, h: 0.7, r: 'c3', n: 'RTL8188EUS + firmware 28.0', t: 'Chip', x: 'Softmac: 802.11 driver karta hai. Firmware sirf H2C commands sambhalta hai. 2.4 GHz, 1T1R, HT40.' }
+    ];
+    L.forEach(function (s) {
+      var m = box(7.2, s.h, 4.2, s.r, { transparent: true, opacity: 0.88 }); m.position.set(0, s.y, 0); edges(m, 'fg', 0.45); g.add(m);
+      addItem(2, m, s.t, s.x);
+      var o = new THREE.Object3D(); o.position.set(0, s.y, 2.15); g.add(o); label(2, s.n, o, 0, null);
+    });
+    for (var k = 0; k < 3; k++) { var p = new THREE.Mesh(new THREE.SphereGeometry(0.16, 14, 10), mat('fg')); g.add(p); packets.push(p); }
+    return {
+      kick: 'Architecture', title: 'Do layers, ek boundary',
+      body: '<p>Hardware ka sara gyaan <code>driver.c</code> mein, Windows ka sara WiFiCx kaam <code>wifi.cpp</code> mein. Beech mein sirf <code>wifi.h</code>.</p><p class="m">Har slab par click karo.</p>',
+      cam: [10, 4.2, 12], tgt: [0, 1.6, 0], g: g,
+      update: function (t) { packets.forEach(function (p, k) { var u = ((t * 0.22 + k / 3) % 1); var down = (k % 2 === 0); var y = down ? 4.9 - u * 6.3 : -1.4 + u * 6.3; p.position.set(-3.3 + k * 3.3, y, 2.4); }); }
+    };
+  })(2));
+
+  /* ---------- SLIDE 3: handshake ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var mode = 'before';
+    var nodes = [
+      { x: -6, n: 'Windows', r: 'c0' }, { x: 0, n: 'Driver', r: 'c2' }, { x: 6, n: 'Router (AP)', r: 'c3' }
+    ];
+    var ap;
+    nodes.forEach(function (n, k) {
+      var s = new THREE.Mesh(new THREE.SphereGeometry(0.95, 32, 20), mat(n.r)); s.position.set(n.x, 0, 0); g.add(s); if (k === 2) ap = s;
+      var o = new THREE.Object3D(); o.position.set(n.x, -1.5, 0); g.add(o); label(3, n.n, o, 0, 'big');
+    });
+    var ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-6, 0, 0), new THREE.Vector3(6, 0, 0)]), lmat('mesh', 0.6)); g.add(ln);
+    var pk = new THREE.Mesh(new THREE.SphereGeometry(0.3, 20, 14), mat('accent', { transparent: true, opacity: 1 })); g.add(pk);
+    var pkLab = label(3, '', pk, -26, null);
+    var msgs = [['msg1 0x008A', 'AP to Windows'], ['msg2 0x010A', 'Windows to AP'], ['msg3 0x13CA', 'AP to Windows'], ['msg4 0x030A', 'Windows to AP']];
+    var PER = 2.4, flash = 0;
+    var capEl;
+    function setMode(m) {
+      mode = m; var bs = document.querySelectorAll('#extra .tg button');
+      for (var q = 0; q < bs.length; q++) bs[q].setAttribute('aria-pressed', bs[q].dataset.m === m ? 'true' : 'false');
+      if (capEl) capEl.textContent = m === 'before'
+        ? 'Pehle: msg4 data descriptor (MCS, BW40, SGI, AGG) ke saath gaya, router ne accept nahi kiya. Router ~6 s baad msg1 phir bhejta hai, 3-11 baar.'
+        : 'Ab: EAPOL 6M OFDM par, plain descriptor. Router msg4 accept karta hai aur handshake ek baar mein poora hota hai.';
+    }
+    return {
+      kick: 'Bug 18, sabse bada reliability fix', title: '4-way handshake: msg4 kho jata tha',
+      body: '<p>Windows handshake hamare data path se chalata hai. Router har ~6 s handshake restart karta tha, kyunki hamara msg4 us tak sahi tarah nahi pahunchta tha.</p>',
+      extra: '<div class="tg" role="group" aria-label="Pehle ya baad"><button id="mB" data-m="before" aria-pressed="true">Pehle</button><button id="mA" data-m="after" aria-pressed="false">Ab</button></div><p id="cap"></p>',
+      onShow: function () { capEl = document.getElementById('cap'); document.getElementById('mB').onclick = function () { setMode('before'); }; document.getElementById('mA').onclick = function () { setMode('after'); }; setMode(mode); },
+      cam: [0, 3.8, 19.5], tgt: [0, 0, 0], g: g,
+      update: function (t) {
+        var idx = Math.floor(t / PER) % 4, p = (t % PER) / PER, fromAP = (idx % 2 === 0);
+        var e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+        var x = fromAP ? 6 - 12 * e : -6 + 12 * e; pk.position.set(x, 0.4, 0);
+        pkLab.el.textContent = msgs[idx][0];
+        var lost = (mode === 'before' && idx === 3 && p > 0.55);
+        pk.material.opacity = lost ? Math.max(0, 1 - (p - 0.55) * 6) : 1;
+        pk.visible = pk.material.opacity > 0.02;
+        var c = (mode === 'before' && idx === 3) ? css('--warn') : css('--accent'); pk.material.color.set(c);
+        var ok = (mode === 'after' && idx === 3 && p > 0.96); if (ok) flash = 1; flash = Math.max(0, flash - 0.02); ap.scale.setScalar(1 + flash * 0.25);
+      }
+    };
+  })(3));
+
+  /* ---------- SLIDE 4: bugs ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group();
+    var cats = ['Build / CI', 'WiFiCx API', 'Data path', 'RF / speed', 'Tooling', 'Connect'];
+    var B = [
+      [0, 'WiFiCx headers nahi mile', 'WDK 26100 mein headers hain, docs nahi.', 'CI se header dump, NetAdapterCx 2.1.'],
+      [0, 'Compile errors (sized delete, new[])', 'Kernel mein C++.', '/Zc:sizedDealloc-, apna netringiterator.h.'],
+      [1, 'INVALID_DATA on association result', 'PHY type list aur beacon missing.', 'ActivePhyTypeList + beacon diya.'],
+      [1, 'TX baar-baar resend', 'TX worker re-enter hota tha.', 'TX worker serialize.'],
+      [1, 'Driver removal hang', 'Work items D0Exit mein WiFiCx call karte the.', 'Stopping flag, sab flush.'],
+      [2, 'DHCP ka reply nahi', 'TX frame/queue mapping galat.', 'Native 802.11 passthrough, Linux capture se match.'],
+      [3, 'Signal strength galat', 'RSSI galat byte se.', 'pwdb_all = PHY status byte 4.'],
+      [3, 'Full descriptor se 3 Mbps', 'Descriptor pieces over-copy.', 'DescMask bisect, default 0x1C.'],
+      [2, '1148 RX ring drops', 'RX ring 64.', '512 frames.'],
+      [3, 'Upload 15-25 Mbps', 'No QoS / aggregation.', 'TX A-MPDU: 35-37 Mbps.'],
+      [2, 'Upload TCP backoff, 5320 drops', 'TX queue 256.', '1024 frames.'],
+      [4, 'Speed test 0 MB', 'Cloudflare ne curl UA block kiya.', 'Custom UA, 4 alag curl processes.'],
+      [4, 'Script edits nahi uthe', 'raw.githubusercontent ~5 min cache.', '?v=N har URL par.'],
+      [4, 'One-liner diag toot gaya', 'Nested quotes.', 'Sab diagnostics script files.'],
+      [5, 'Slow reconnect', 'Auth/assoc retries kam.', 'Tries 4 to 8 aur 4 to 6.'],
+      [5, 'Lamba no-internet', 'Cfg_LinkState=1.', 'Default 0.'],
+      [2, 'RX wakeup lost hone ka shak', 'Arm-after-drain race.', 'EvtRxNotify guard + ResetRx.'],
+      [5, 'Router har ~6 s handshake restart', 'msg4 MCS/BW40/AGG descriptor se gaya.', 'EAPOL 6M OFDM plain (Cfg_EapolLow).'],
+      [5, 'Event 8001 Authentication: Unknown', 'WDI auth algorithm reporting.', 'Cosmetic, fix nahi kiya.'],
+      [5, 'Diagnostic counters stuck state ke nahi', 'Stats timer sirf JOIN_UP mein.', 'Timer HW-ready par hamesha.']
+    ];
+    var spheres = [];
+    B.forEach(function (b, k) {
+      var a = k * 0.62, y = (k - 9.5) * 0.4;
+      var s = new THREE.Mesh(new THREE.SphereGeometry(0.4, 24, 16), mat('c' + b[0])); s.position.set(Math.cos(a) * 3.4, y, Math.sin(a) * 3.4); g.add(s);
+      addItem(4, s, '#' + (k + 1) + ' ' + b[1], 'Cause: ' + b[2] + ' Fix: ' + b[3]); spheres.push(s);
+      label(4, String(k + 1), s, 0, null);
+    });
+    var cols = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5'];
+    var legend = '<ul class="legend">' + cats.map(function (c, k) { return '<li><i style="background:var(--c' + k + ')"></i>' + c + '</li>'; }).join('') + '</ul>';
+    return {
+      kick: 'Bugs', title: '20 bugs, 19 fix',
+      body: '<p>Build se lekar reconnect tak. Rang bug ki category dikhata hai. Bug 10 se speed badhi, bug 18 se reconnect.</p>' + legend,
+      cam: [0, 1.5, 18], tgt: [0, 0, 0], g: g,
+      update: function (t) { g.rotation.y = t * 0.12; }
+    };
+  })(4));
+
+  /* ---------- SLIDE 5: chronology ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var pil = [];
+    var D = [
+      ['Oct 5', 6, 'Repo bana, GitHub Actions ARM64 build workflow.'],
+      ['Oct 6', 0, 'Koi commit nahi.'],
+      ['Oct 7', 9, 'Hardware: EFUSE/MAC, firmware download rev 28.0, 507-write init replay, passive aur active scan, TX power.'],
+      ['Oct 8', 37, 'WiFiCx skeleton. Bahut saare CI probe commits (WDK headers dump), phir real BSS scan results.'],
+      ['Oct 9', 17, 'Open-network join, association result fix, data path, Linux usbmon capture, post-association registers.'],
+      ['Oct 10', 23, 'WPA2 CCMP, native 802.11 datapath, RSSI auto-rate, ADDBA response, link-loss, reconnect test.'],
+      ['Oct 11', 9, 'Async pipelined TX, USB TX aggregation (gain nahi, off), x86 USBPcap capture script, HT40 regs.'],
+      ['Oct 12', 16, 'HT40 + DescMask bisect, RX ring 512, update.ps1, TX A-MPDU (upload 35-37), TX queue 1024, test harness fixes.'],
+      ['Oct 13', 14, 'EAPOL ring + eapol.ps1, EAPOL 6M OFDM fix, RX wakeup guard, stats timer fix, docs.']
+    ];
+    var base = box(19, 0.1, 3, 'dim', { transparent: true, opacity: 0.5 }); base.position.set(0, -0.05, 0); g.add(base);
+    D.forEach(function (d, k) {
+      var x = (k - 4) * 2.1, h = Math.max(0.06, d[1] * 0.13);
+      var m = box(1.2, h, 1.2, d[1] === 0 ? 'dim' : 'accent'); m.geometry.translate(0, h / 2, 0); m.position.set(x, 0, 0); edges(m, 'fg', 0.3); g.add(m); pil.push(m);
+      addItem(5, m, d[0] + ': ' + d[1] + ' commits', d[2]);
+      var a = new THREE.Object3D(); a.position.set(x, 0, 1.1); g.add(a); label(5, d[0], a, 0, 'sm');
+      var c = new THREE.Object3D(); c.position.set(x, h + 0.5, 0); g.add(c); label(5, String(d[1]), c, 0, 'big');
+    });
+    return {
+      kick: 'Chronology', title: '131 commits, 9 din',
+      body: '<p>Har pillar ek din ke commits hai. Oct 8 sabse bhaari raha, kyunki WiFiCx ke headers aur structs undocumented the aur CI se dump karne pade.</p><p class="m">Pillar par click karo, us din ka kaam padho.</p>',
+      cam: [0, 5.2, 23], tgt: [0, 2.2, 0], g: g,
+      update: function (t, te) { pil.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.08) / 0.8)); }); }
+    };
+  })(5));
+
+  /* ---------- SLIDE 6: methodology ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var ring = new THREE.Group(); g.add(ring);
+    var S = [
+      ['Reference first', 'Working adapter ka capture (USBPcap, usbmon) aur byte-by-byte compare: init, descriptors, registers.'],
+      ['Smallest verifiable step', 'Ek phase, ek observable result. Unverified phase par agla shuru nahi.'],
+      ['Observable bina debugger', 'Guess se pehle Log_* registry counter. Ek sawal, ek script, ek txt file.'],
+      ['A/B knobs, rebuild nahi', 'Doubtful behavior ek Cfg_* knob. INF default = current best.'],
+      ['Trusted harness', 'Byte counts validate karo, parallel streams, speed ke saath drops note karo.'],
+      ['Bottleneck fix, re-measure', 'Ring 64 se 512, queue 256 se 1024, A-MPDU, EAPOL rate.'],
+      ['Evidence sahi padho', 'Driver ring ko Windows events se correlate karo. Jo dikha nahi wo bhi gino.'],
+      ['Push, CI, update', 'gh run list green, 1-2 min wait, har URL par fresh ?v=N.'],
+      ['User ki mehnat kam', 'Ek command andar, ek file bahar. Tests ki chain nahi.']
+    ];
+    var pts = [];
+    S.forEach(function (s, k) {
+      var a = (k / S.length) * Math.PI * 2 - Math.PI / 2, x = Math.cos(a) * 4.6, z = Math.sin(a) * 4.6;
+      var m = box(1.3, 1.3, 1.3, 'c' + (k % 6 === 4 ? 4 : (k % 3))); m.position.set(x, 0, z); m.rotation.y = -a; edges(m, 'fg', 0.4); ring.add(m);
+      addItem(6, m, (k + 1) + '. ' + s[0], s[1]); pts.push(new THREE.Vector3(x, 0, z));
+      label(6, String(k + 1), m, 0, 'big');
+    });
+    pts.push(pts[0].clone());
+    ring.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lmat('mesh', 0.5)));
+    var core = new THREE.Mesh(new THREE.TorusKnotGeometry(0.9, 0.22, 90, 12), mat('accent')); g.add(core);
+    return {
+      kick: 'Methodology', title: '9 steps, har phase mein repeat',
+      body: '<p>Ye ek loop hai: step 9 se wapas step 1. Har naya phase isi chakra se guzra.</p><p class="m">Cube par click karo.</p>',
+      cam: [0, 7.5, 11.5], tgt: [0, 0, 0], g: g,
+      update: function (t) { ring.rotation.y = t * 0.1; core.rotation.x = t * 0.4; core.rotation.y = t * 0.55; }
+    };
+  })(6));
+
+  /* ---------- SLIDE 7: open problem ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group();
+    var core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.1, 1), mat('warn')); g.add(core);
+    label(7, '11006 key exchange failed', core, 34, null);
+    var H = [
+      ['Windows RX queue drain nahi ho rahi', 'Ring full (RxRingDrop), notification re-arm nahi hua. Driver ne msg1 log kiya, Windows ne msg2 nahi bheja.'],
+      ['Queue cancel hui, recreate nahi', 'EvtRxCancel RxQueue=nullptr karta hai; naya queue na bane to koi notification fire nahi hoga.'],
+      ['Device idle / D0 cycle', 'Selective suspend ke baad hardware state stale ho sakti hai.'],
+      ['CAM / security state stale', 'Lambe session ke baad keys ya security config purane reh jana.']
+    ];
+    var orbs = [];
+    H.forEach(function (h, k) {
+      var a = -Math.PI * 0.85 + k * (Math.PI * 1.7 / 3);
+      var m = new THREE.Mesh(new THREE.OctahedronGeometry(0.75), mat('c3')); m.position.set(Math.cos(a) * 4.6, 0.2 + (k % 2) * 0.6, Math.sin(a) * 2.6 - 1); g.add(m); orbs.push(m);
+      addItem(7, m, 'Hypothesis ' + (k + 1) + ': ' + h[0], h[1] + ' (proven nahi)');
+      label(7, 'H' + (k + 1), m, 0, 'big');
+      g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), m.position.clone()]), lmat('mesh', 0.35)));
+    });
+    return {
+      kick: 'Open', title: 'Kuch minute baad connect fail hota hai',
+      body: '<p>Association OK, router msg1 bhejta hai, driver log karta hai, lekin Windows msg2 kabhi nahi bhejta. Root cause abhi proven nahi hai; chaar hypotheses hain.</p><p class="m">Agla kadam: failure live ho to Ethernet lagao, reboot nahi, diag_now.ps1 chalao.</p>',
+      cam: [0, 4, 13.5], tgt: [0, 0.2, -0.5], g: g,
+      update: function (t) { core.rotation.x = t * 0.5; core.rotation.y = t * 0.7; core.scale.setScalar(1 + Math.sin(t * 2.4) * 0.06); orbs.forEach(function (o, k) { o.rotation.y = t * 0.6 + k; o.position.y = 0.2 + (k % 2) * 0.6 + Math.sin(t + k) * 0.15; }); }
+    };
+  })(7));
+
+  /* ---------- SLIDE 8: handoff ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var docs = [];
+    var F = [
+      ['docs/TECHNICAL_DOCUMENTATION.md', 'c1', 'Files, architecture, 20 bugs, chronology, methodology, open problem, gotchas.'],
+      ['docs/AGENT_PROMPT.md', 'accent', 'Naye agent ke liye full-context prompt: Hinglish rule, workflow, facts, open problem, definition of done.'],
+      ['diag_now / eapol / timeline .ps1', 'c3', 'Failure ke dauran ek command, ek txt file. Inse root cause pakda jayega.']
+    ];
+    F.forEach(function (f, k) {
+      var m = box(2.8, 3.6, 0.22, f[1]); m.position.set((k - 1) * 3.6, 0, 0); edges(m, 'fg', 0.45); g.add(m); docs.push(m);
+      addItem(8, m, f[0], f[2]);
+      var o = new THREE.Object3D(); o.position.set((k - 1) * 3.6, -2.4, 0); g.add(o); label(8, f[0], o, 0, 'sm');
+    });
+    return {
+      kick: 'Handoff', title: 'Agla agent isi se shuru kare',
+      body: '<p>Repo mein <code>docs/</code> ke andar documentation aur reusable agent prompt hai. Naye session mein AGENT_PROMPT.md paste karo; agent doc padhega, Hinglish mein jawab dega aur ek hi diagnostic file maangega.</p><p class="m">Cards par click karo.</p>',
+      cam: [0, 1.2, 13], tgt: [0, 0, 0], g: g,
+      update: function (t) { docs.forEach(function (d, k) { d.rotation.y = Math.sin(t * 0.5 + k * 1.3) * 0.3; d.position.y = Math.sin(t * 0.8 + k) * 0.15; }); }
+    };
+  })(8));
+
+  /* ---------- deck plumbing ---------- */
+  var N = slides.length, SP = 80, cur = 0, enter = 0, selected = null;
+  slides.forEach(function (s, k) { s.g.position.x = k * SP; scene.add(s.g); });
+  var camPos = new THREE.Vector3(), camTgt = new THREE.Vector3(), px = 0, py = 0, tpx = 0, tpy = 0;
+  var el = { kick: document.getElementById('kick'), ttl: document.getElementById('ttl'), body: document.getElementById('body'), extra: document.getElementById('extra'), info: document.getElementById('info'), cnt: document.getElementById('cnt'), dots: document.getElementById('dots') };
+  slides.forEach(function (s, k) {
+    var b = document.createElement('button'); b.setAttribute('aria-label', 'Slide ' + (k + 1)); b.onclick = function () { go(k); }; el.dots.appendChild(b);
+  });
+  function setInfo(i) {
+    el.info.innerHTML = '';
+    if (!i) { var has = items.some(function (m) { return m.userData.slide === cur; }); var h = document.createElement('p'); h.className = 'hint'; h.textContent = has ? 'Scene mein kisi object par click karo.' : ''; el.info.appendChild(h); el.info.style.display = has ? '' : 'none'; return; }
+    el.info.style.display = '';
+    var t = document.createElement('h2'); t.textContent = i.t; var p = document.createElement('p'); p.textContent = i.x; el.info.appendChild(t); el.info.appendChild(p);
+  }
+  function go(k, instant) {
+    k = (k + N) % N; cur = k; enter = 0; selected = null;
+    items.forEach(function (m) { m.scale.copy(m.userData.base); });
+    var s = slides[k];
+    el.kick.textContent = s.kick; el.ttl.textContent = s.title; el.body.innerHTML = s.body; el.extra.innerHTML = s.extra || '';
+    setInfo(null); if (s.onShow) s.onShow();
+    el.cnt.textContent = String(k + 1).padStart(2, '0') + ' / ' + String(N).padStart(2, '0');
+    var ds = el.dots.children; for (var q = 0; q < ds.length; q++) ds[q].setAttribute('aria-current', q === k ? 'true' : 'false');
+    try { history.replaceState(null, '', '#s' + (k + 1)); } catch (e) {}
+    if (instant) { camPos.set(k * SP + s.cam[0], s.cam[1], s.cam[2]); camTgt.set(k * SP + s.tgt[0], s.tgt[1], s.tgt[2]); }
+  }
+  document.getElementById('prev').onclick = function () { go(cur - 1); };
+  document.getElementById('next').onclick = function () { go(cur + 1); };
+  addEventListener('keydown', function (e) { if (e.key === 'ArrowRight' || e.key === 'PageDown') go(cur + 1); else if (e.key === 'ArrowLeft' || e.key === 'PageUp') go(cur - 1); });
+
+  /* picking */
+  var ray = new THREE.Raycaster(), mouse = new THREE.Vector2(), down = null, hover = null;
+  function pick(e) {
+    var r = cv.getBoundingClientRect(); mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(mouse, camera);
+    var hit = ray.intersectObjects(items.filter(function (m) { return m.userData.slide === cur; }), false)[0]; return hit ? hit.object : null;
+  }
+  cv.addEventListener('pointerdown', function (e) { down = { x: e.clientX, y: e.clientY }; });
+  cv.addEventListener('pointerup', function (e) {
+    if (!down) return; var moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null; if (moved > 6) return;
+    var o = pick(e); items.forEach(function (m) { m.scale.copy(m.userData.base); }); selected = o;
+    if (o) { o.scale.copy(o.userData.base).multiplyScalar(1.18); setInfo(o.userData.info); } else setInfo(null);
+  });
+  cv.addEventListener('pointermove', function (e) {
+    tpx = (e.clientX / innerWidth - 0.5); tpy = (e.clientY / innerHeight - 0.5);
+    if (e.pointerType === 'mouse') { hover = pick(e); cv.style.cursor = hover ? 'pointer' : 'default'; }
+  });
+
+  /* resize with the scene shifted clear of the panel */
+  function resize() {
+    var w = innerWidth, h = innerHeight; renderer.setSize(w, h, false); camera.aspect = w / h;
+    var narrow = w <= 760, off = narrow ? 0 : Math.min(400, w * 0.36) / 2 + 8, offY = narrow ? h * 0.2 : 0;
+    camera.setViewOffset(w, h, -off, offY, w, h); camera.fov = narrow ? 58 : 42; camera.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize);
+
+  /* theme change */
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+  new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  var t0 = performance.now(), last = t0;
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now; var t = RM ? 0.001 : Math.max(0.001, (now - t0) / 1000); enter += dt;
+    var s = slides[cur];
+    var k = RM ? 1 : 1 - Math.pow(0.0009, dt);
+    px += (tpx - px) * 0.05; py += (tpy - py) * 0.05;
+    var wp = new THREE.Vector3(cur * SP + s.cam[0] + (RM ? 0 : px * 1.6), s.cam[1] - (RM ? 0 : py * 0.9), s.cam[2]);
+    camPos.lerp(wp, k); camTgt.lerp(new THREE.Vector3(cur * SP + s.tgt[0], s.tgt[1], s.tgt[2]), k);
+    camera.position.copy(camPos); camera.lookAt(camTgt);
+    slides.forEach(function (sl, idx) { if (Math.abs(idx - cur) <= 1) sl.update(t, idx === cur ? enter : 99); });
+    items.forEach(function (m) { if (m !== selected && m.userData.slide === cur) { var tgt = (m === hover) ? 1.08 : 1; m.scale.x += (m.userData.base.x * tgt - m.scale.x) * 0.2; m.scale.z += (m.userData.base.z * tgt - m.scale.z) * 0.2; if (m.userData.slide !== 1 && m.userData.slide !== 5) m.scale.y += (m.userData.base.y * tgt - m.scale.y) * 0.2; } });
+    renderer.render(scene, camera);
+    var w = innerWidth, h = innerHeight;
+    labels.forEach(function (L) {
+      if (L.slide !== cur) { L.el.style.opacity = 0; return; }
+      L.target.getWorldPosition(tmpV); tmpV.project(camera);
+      if (tmpV.z > 1) { L.el.style.opacity = 0; return; }
+      L.el.style.opacity = 1; L.el.style.transform = 'translate(-50%,-50%) translate(' + ((tmpV.x * 0.5 + 0.5) * w).toFixed(1) + 'px,' + ((-tmpV.y * 0.5 + 0.5) * h + L.dy).toFixed(1) + 'px)';
+    });
+    requestAnimationFrame(frame);
+  }
+  resize(); applyTheme();
+  var start = 0; try { var m = /^#s(\d+)$/.exec(location.hash); if (m) start = Math.min(N, Math.max(1, +m[1])) - 1; } catch (e) {}
+  go(start, true); requestAnimationFrame(frame);
+})();
+</script>

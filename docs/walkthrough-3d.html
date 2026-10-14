@@ -42,6 +42,9 @@ body { margin: 0; background: var(--bg); color: var(--fg); font: 400 15px/1.55 v
 .kick { margin: 0 0 10px; font: 600 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
 h1 { margin: 0 0 12px; font: 800 clamp(26px, 3.4vw, 38px)/1.04 var(--display); letter-spacing: -.02em; text-wrap: balance; }
 #body p { margin: 0 0 10px; color: var(--fg); max-width: 62ch; }
+#body ul { margin: 0 0 10px; padding-left: 18px; }
+#body ul.legend { margin: 8px 0 0; padding-left: 0; }
+#body li { margin: 0 0 4px; }
 #body p.m { color: var(--muted); font-size: 13.5px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; padding: 0; list-style: none; }
 .chips li { font: 600 12px/1 var(--mono); padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
@@ -132,7 +135,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   var slides = [], items = [];
   function addItem(slideIdx, mesh, title, text) { mesh.userData.info = { t: title, x: text }; mesh.userData.slide = slideIdx; mesh.userData.base = mesh.scale.clone(); items.push(mesh); }
 
-  /* ---------- SLIDE 0: title ---------- */
+  /* ---------- slide 0 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group();
     var d = box(2.6, 0.45, 1.1, 'mesh'); edges(d, 'fg', 0.5); g.add(d);
@@ -154,7 +157,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     };
   })(0));
 
-  /* ---------- SLIDE 1: results ---------- */
+  /* ---------- slide 1 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var bars = [];
     var data = [
@@ -166,13 +169,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     ];
     var fl = box(12, 0.1, 3.6, 'dim', { transparent: true, opacity: 0.5 }); fl.position.set(0, -0.05, 0); g.add(fl);
     data.forEach(function (d, k) {
-      var h = d.v * 0.1; var b = box(1.0, h, 1.0, d.r); b.geometry.translate(0, h / 2, 0); b.position.set(d.x, 0, 0); edges(b, 'fg', 0.35); g.add(b);
-      bars.push(b); addItem(1, b, d.c + ': ' + d.n + ' ' + d.v + ' Mbps', d.i);
-      var v = new THREE.Object3D(); v.position.set(d.x, h + 0.45, 0); g.add(v); label(1, d.v + '', v, 0, 'big');
-      var nn = new THREE.Object3D(); nn.position.set(d.x, 0, 0.9); g.add(nn); label(1, d.n, nn, 0, 'sm');
+      var h = d.v * 0.1; var b = box(1.0, h, 1.0, d.r); b.geometry.translate(0, h / 2, 0); b.position.set(d.x, 0, 0); edges(b, 'fg', 0.35); g.add(b); b.userData.bar = 1;
+      bars.push(b); addItem(i, b, d.c + ': ' + d.n + ' ' + d.v + ' Mbps', d.i);
+      var v = new THREE.Object3D(); v.position.set(d.x, h + 0.45, 0); g.add(v); label(i, d.v + '', v, 0, 'big');
+      var nn = new THREE.Object3D(); nn.position.set(d.x, 0, 0.9); g.add(nn); label(i, d.n, nn, 0, 'sm');
     });
-    var a = new THREE.Object3D(); a.position.set(-3.9, 0, 2.1); g.add(a); label(1, 'DOWNLOAD (Mbps)', a, 6, null);
-    var b2 = new THREE.Object3D(); b2.position.set(3.0, 0, 2.1); g.add(b2); label(1, 'UPLOAD (Mbps)', b2, 6, null);
+    var a = new THREE.Object3D(); a.position.set(-3.9, 0, 2.1); g.add(a); label(i, 'DOWNLOAD (Mbps)', a, 6, null);
+    var b2 = new THREE.Object3D(); b2.position.set(3.0, 0, 2.1); g.add(b2); label(i, 'UPLOAD (Mbps)', b2, 6, null);
     return {
       kick: 'Result', title: 'Download ~38, upload ~36 Mbps',
       body: '<p>Connect, DHCP, internet, HT40 aur A-MPDU sab chalta hai. Download real Realtek driver se aage hai; upload ka gap ~9 Mbps hai.</p><p class="m">Bars par click karo.</p>',
@@ -181,7 +184,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     };
   })(1));
 
-  /* ---------- SLIDE 2: architecture ---------- */
+  /* ---------- slide 2 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var packets = [];
     var L = [
@@ -193,8 +196,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     ];
     L.forEach(function (s) {
       var m = box(7.2, s.h, 4.2, s.r, { transparent: true, opacity: 0.88 }); m.position.set(0, s.y, 0); edges(m, 'fg', 0.45); g.add(m);
-      addItem(2, m, s.t, s.x);
-      var o = new THREE.Object3D(); o.position.set(0, s.y, 2.15); g.add(o); label(2, s.n, o, 0, null);
+      addItem(i, m, s.t, s.x);
+      var o = new THREE.Object3D(); o.position.set(0, s.y, 2.15); g.add(o); label(i, s.n, o, 0, null);
     });
     for (var k = 0; k < 3; k++) { var p = new THREE.Mesh(new THREE.SphereGeometry(0.16, 14, 10), mat('fg')); g.add(p); packets.push(p); }
     return {
@@ -205,7 +208,133 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     };
   })(2));
 
-  /* ---------- SLIDE 3: handshake ---------- */
+  /* ---------- slide 3 ---------- */
+slides.push((function (i) {
+  var g = new THREE.Group();
+  var P = [
+    ['1. Bring-up', 'Gate: SYS_CFG padh sakte hain, firmware ready, 507 init writes verify. Approach: captured init replay, kuch invent nahi.', 'accent'],
+    ['2. Scan', 'Gate: Windows UI mein real BSS list. Approach: pehle passive, phir active scan, WDI BSS entry indications.', 'accent'],
+    ['3. Open join', 'Gate: open network par DHCP lease. Approach: Linux capture se byte-for-byte match.', 'accent'],
+    ['4. WPA2', 'Gate: 4-way handshake + internet. Approach: Windows handshake chalata hai, driver sirf CAM mein keys install karta hai.', 'accent'],
+    ['5. Speed', 'Gate: download real Realtek driver ke barabar. Approach: measure, descriptor bisect, A-MPDU, queue sizing.', 'accent'],
+    ['6. Reliability', 'Gate: lambe session mein baar-baar reconnect. Approach: pehle instrument, phir fix; evidence se, guess se nahi. Abhi chal raha hai.', 'c3']
+  ];
+  var st = [];
+  P.forEach(function (p, k) {
+    var h = 0.8 + k * 0.7, m = box(1.7, h, 1.7, p[2]); m.geometry.translate(0, h / 2, 0); m.position.set((k - 2.5) * 2.2, 0, 0); edges(m, 'fg', 0.4); g.add(m); st.push(m); m.userData.bar = 1;
+    addItem(i, m, p[0], p[1]);
+    var a = new THREE.Object3D(); a.position.set((k - 2.5) * 2.2, 0, 1.1); g.add(a); label(i, p[0], a, 4, 'sm');
+  });
+  var fl = box(14.5, 0.1, 3.2, 'dim', { transparent: true, opacity: 0.5 }); fl.position.set(0, -0.05, 0); g.add(fl);
+  return {
+    kick: 'Strategy', title: 'Phase-gated, evidence pehle',
+    body: '<p>Har phase ka ek observable pass criterion; agla phase tabhi shuru jab pichla verify ho.</p><ul><li>Jo kaam kar chuka use copy karo, invent mat karo.</li><li>Hardware risk aur Windows risk alag layers mein.</li><li>Remote debugging ke liye driver khud instrument.</li><li>Sabse anjaan cheez (WiFiCx) pehle probe karo.</li></ul><p class="m">Seedhi par click karo.</p>',
+    cam: [0, 3.6, 21.5], tgt: [0, 2.2, 0], g: g,
+    update: function (t, te) { st.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.12) / 0.8)); }); }
+  };
+})(3));
+
+/* ---------- slide 4 ---------- */
+slides.push((function (i) {
+  var g = new THREE.Group();
+  var GN = ['Capture', 'Observability', 'Performance', 'Tooling', 'Safety'];
+  var T = [
+    [0, 'USB capture diffing', 'USBPcap (x86 Windows, vendor driver) aur usbmon (Linux, rtl8xxxu): init, TX descriptors, post-association registers (EDCA, RRSR, INIRTS, TBTT, AGGLEN) compare kiye.'],
+    [0, 'Init-table replay + verify', '507 MAC/BB/AGC/RF writes capture se replay, read-back verify. 3 mismatches (0xD70/74/78) baaki.'],
+    [0, 'Firmware rev 28.0 embed', 'Firmware C array (fwdata.h), power-on par download.'],
+    [0, 'EFUSE-derived values', 'MAC, TX power aur crystal cap EFUSE se, hard-coded nahi.'],
+    [0, 'CI header probing', 'Undocumented WiFiCx 1.0: CI workflow ne WDK headers aur struct signatures artifact mein dump kiye.'],
+    [1, 'Registry Log_* channel', 'Debugger nahi, isliye driver counters registry mein likhta hai, scripts padhte hain.'],
+    [1, 'Cfg_* knobs A/B', 'Har experiment ek registry knob, INF default = best; flip, measure, restore; rebuild nahi.'],
+    [1, 'Self-test replay', 'Exact Linux DHCP DISCOVER exact descriptor ke saath replay: descriptor bug aur datapath bug alag kiye.'],
+    [1, 'Frame logging + histograms', 'Pehle TX/RX frames hex mein, TX classes (ARP/DHCP/IPv4/IPv6), RX frame-type histograms.'],
+    [1, 'EAPOL ring + timeline', '128-entry ring (time, direction, key-info, replay counter) Windows WLAN/DHCP events ke saath merged (eapol.ps1, timeline.ps1).'],
+    [2, 'DescMask bisect', 'Real-Realtek descriptor pieces ka bit-mask; best combo 0x1C. Full real descriptor 3 Mbps deta tha.'],
+    [2, 'Per-class RSSI rate pick', 'OFDM/HT aur CCK ka alag RSSI; MCS7/MCS4/24M/11M thresholds; pick histograms.'],
+    [2, 'Async pipelined TX', '8 USB write slots + semaphore, TxQ 1024; slot starvation aur queue depth diagnostics.'],
+    [2, 'A-MPDU gating', 'ADDBA request >=100 frames ke baad; AGG_EN aur QoS data tab jab AP status 0 de. Upload 19-26 se 35-37.'],
+    [3, '4-stream curl harness', '4 alag curl processes, custom User-Agent, byte-count validation, errors logged.'],
+    [3, 'One command, one file', 'update.ps1 (profile backup/restore, transcript) aur diagnostics jo ek Desktop txt likhte hain.'],
+    [4, 'Safe unload', 'Stopping flag, work-item flush, async TX drain, D0Exit se pehle.'],
+    [4, 'Lost-wakeup guard', 'EvtRxNotify spinlock ke andar ring dekh ke arm karta hai; connect par ResetRx.']
+  ];
+  var cubes = [];
+  T.forEach(function (t, k) {
+    var c = k % 6, r = Math.floor(k / 6);
+    var m = box(1.2, 1.2, 1.2, 'c' + t[0]); m.position.set((c - 2.5) * 2, (1 - r) * 2.1, 0); edges(m, 'fg', 0.4); g.add(m); cubes.push(m);
+    addItem(i, m, t[1], t[2]); label(i, String(k + 1), m, 0, 'big');
+  });
+  var lg = '<ul class="legend">' + GN.map(function (n, k) { return '<li><i style="background:var(--c' + k + ')"></i>' + n + '</li>'; }).join('') + '</ul>';
+  return {
+    kick: 'Techniques', title: '18 techniques jo kaam aayi',
+    body: '<p>Capture se lekar safe unload tak. Rang technique ka group dikhata hai.</p>' + lg + '<p class="m">Cube par click karo.</p>',
+    cam: [0, 3, 17], tgt: [0, 0.5, 0], g: g,
+    update: function (t) { cubes.forEach(function (m, k) { m.rotation.y = Math.sin(t * 0.6 + k) * 0.25; m.position.y = ((1 - Math.floor(k / 6)) * 2.1) + Math.sin(t * 0.9 + k * 0.7) * 0.08; }); }
+  };
+})(4));
+
+/* ---------- slide 5 ---------- */
+  slides.push((function (i) {
+    var g = new THREE.Group(); var pil = [];
+    var D = [
+      ['Oct 5', 6, 'Repo bana, GitHub Actions ARM64 build workflow.'],
+      ['Oct 6', 0, 'Koi commit nahi.'],
+      ['Oct 7', 9, 'Hardware: EFUSE/MAC, firmware download rev 28.0, 507-write init replay, passive aur active scan, TX power.'],
+      ['Oct 8', 37, 'WiFiCx skeleton. Bahut saare CI probe commits (WDK headers dump), phir real BSS scan results.'],
+      ['Oct 9', 17, 'Open-network join, association result fix, data path, Linux usbmon capture, post-association registers.'],
+      ['Oct 10', 23, 'WPA2 CCMP, native 802.11 datapath, RSSI auto-rate, ADDBA response, link-loss, reconnect test.'],
+      ['Oct 11', 9, 'Async pipelined TX, USB TX aggregation (gain nahi, off), x86 USBPcap capture script, HT40 regs.'],
+      ['Oct 12', 16, 'HT40 + DescMask bisect, RX ring 512, update.ps1, TX A-MPDU (upload 35-37), TX queue 1024, test harness fixes.'],
+      ['Oct 13', 14, 'EAPOL ring + eapol.ps1, EAPOL 6M OFDM fix, RX wakeup guard, stats timer fix, docs.']
+    ];
+    var base = box(19, 0.1, 3, 'dim', { transparent: true, opacity: 0.5 }); base.position.set(0, -0.05, 0); g.add(base);
+    D.forEach(function (d, k) {
+      var x = (k - 4) * 2.1, h = Math.max(0.06, d[1] * 0.13);
+      var m = box(1.2, h, 1.2, d[1] === 0 ? 'dim' : 'accent'); m.geometry.translate(0, h / 2, 0); m.position.set(x, 0, 0); edges(m, 'fg', 0.3); g.add(m); pil.push(m); m.userData.bar = 1;
+      addItem(i, m, d[0] + ': ' + d[1] + ' commits', d[2]);
+      var a = new THREE.Object3D(); a.position.set(x, 0, 1.1); g.add(a); label(i, d[0], a, 0, 'sm');
+      var c = new THREE.Object3D(); c.position.set(x, h + 0.5, 0); g.add(c); label(i, String(d[1]), c, 0, 'big');
+    });
+    return {
+      kick: 'Chronology', title: '131 commits, 9 din',
+      body: '<p>Har pillar ek din ke commits hai. Oct 8 sabse bhaari raha, kyunki WiFiCx ke headers aur structs undocumented the aur CI se dump karne pade.</p><p class="m">Pillar par click karo, us din ka kaam padho.</p>',
+      cam: [0, 5.2, 23], tgt: [0, 2.2, 0], g: g,
+      update: function (t, te) { pil.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.08) / 0.8)); }); }
+    };
+  })(5));
+
+  /* ---------- slide 6 ---------- */
+slides.push((function (i) {
+  var g = new THREE.Group();
+  var S = [
+    ['Symptom', 'GUI se disconnect aur reconnect par "Can\'t connect"; kabhi ~60 s tak internet nahi.', 'c0'],
+    ['Automated repro', 'diag_conn.ps1: connect, netsh disconnect, reconnect. LinkState 0 aur 1 dono OK, par JoinRuns 5/6 vs 3.', 'c3'],
+    ['Zyada retries', 'AP deauth ke baad slow jawab deta hai: auth tries 4 se 8, assoc 4 se 6.', 'accent'],
+    ['Galat lead: LinkState=1', 'Link state mirror karne se reconnect ke baad lamba no-internet. Default wapas 0.', 'c3'],
+    ['Chhupe hue events', 'diag_now ne 11004/5/10 filter karke ~30 flapping security events chhupa diye. timeline.ps1 ne dikhaya: bina nayi association ke har ~6 s security restart.', 'accent'],
+    ['EAPOL ring', 'Router har ~6.1 s 4-way restart karta hai (replay counter 1/2), har round ~10 ms. Hypothesis: msg4 accept nahi hota.', 'accent'],
+    ['Galat lead: RX wakeup', 'Lost-wakeup guard + ring flush lagaya. Loop wahi raha; fix rakha, par cause nahi tha.', 'c3'],
+    ['Fix: EAPOL 6M OFDM', 'msg4 plain basic-rate descriptor se. 4 mein se 3 reconnect turant.', 'accent'],
+    ['Naya failure', 'Kuch minute baad msg1 aata hai, msg2 kabhi nahi jaata, event 11006. Counters stuck period ke the hi nahi, ab fix; live diag_now ka intezaar.', 'warn']
+  ];
+  var pts = [], nodes = [];
+  S.forEach(function (s, k) {
+    var x = (k - 4) * 1.3, y = Math.sin(k * 0.9) * 1.3 + 1.6, z = Math.cos(k * 0.9) * 1.2;
+    var m = new THREE.Mesh(new THREE.SphereGeometry(0.5, 24, 16), mat(s[2])); m.position.set(x, y, z); g.add(m); nodes.push(m);
+    pts.push(new THREE.Vector3(x, y, z));
+    addItem(i, m, (k + 1) + '. ' + s[0], s[1]); label(i, String(k + 1), m, 0, 'big');
+  });
+  g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lmat('mesh', 0.6)));
+  var lg = '<ul class="legend"><li><i style="background:var(--accent)"></i>kaam kiya</li><li><i style="background:var(--c3)"></i>galat lead ya adhura</li><li><i style="background:var(--c0)"></i>symptom</li><li><i style="background:var(--warn)"></i>abhi open</li></ul>';
+  return {
+    kick: 'Chronology, Oct 13', title: 'Reconnect bug: 9 kadam',
+    body: '<p>Sabse lamba investigation, galat leads ke saath. Seekh: jo cheez nahi dikhi (missing TX msg2) wo dikhi hui cheez (RX msg1) se zyada important nikli.</p>' + lg + '<p class="m">Goli par click karo.</p>',
+    cam: [0, 2.6, 18], tgt: [0, 1.6, 0], g: g,
+    update: function (t) { nodes.forEach(function (m, k) { m.position.y = pts[k].y + Math.sin(t * 0.9 + k) * 0.08; }); }
+  };
+})(6));
+
+/* ---------- slide 7 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var mode = 'before';
     var nodes = [
@@ -214,11 +343,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     var ap;
     nodes.forEach(function (n, k) {
       var s = new THREE.Mesh(new THREE.SphereGeometry(0.95, 32, 20), mat(n.r)); s.position.set(n.x, 0, 0); g.add(s); if (k === 2) ap = s;
-      var o = new THREE.Object3D(); o.position.set(n.x, -1.5, 0); g.add(o); label(3, n.n, o, 0, 'big');
+      var o = new THREE.Object3D(); o.position.set(n.x, -1.5, 0); g.add(o); label(i, n.n, o, 0, 'big');
     });
     var ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-6, 0, 0), new THREE.Vector3(6, 0, 0)]), lmat('mesh', 0.6)); g.add(ln);
     var pk = new THREE.Mesh(new THREE.SphereGeometry(0.3, 20, 14), mat('accent', { transparent: true, opacity: 1 })); g.add(pk);
-    var pkLab = label(3, '', pk, -26, null);
+    var pkLab = label(i, '', pk, -26, null);
     var msgs = [['msg1 0x008A', 'AP to Windows'], ['msg2 0x010A', 'Windows to AP'], ['msg3 0x13CA', 'AP to Windows'], ['msg4 0x030A', 'Windows to AP']];
     var PER = 2.4, flash = 0;
     var capEl;
@@ -247,9 +376,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
         var ok = (mode === 'after' && idx === 3 && p > 0.96); if (ok) flash = 1; flash = Math.max(0, flash - 0.02); ap.scale.setScalar(1 + flash * 0.25);
       }
     };
-  })(3));
+  })(7));
 
-  /* ---------- SLIDE 4: bugs ---------- */
+  /* ---------- slide 8 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group();
     var cats = ['Build / CI', 'WiFiCx API', 'Data path', 'RF / speed', 'Tooling', 'Connect'];
@@ -279,8 +408,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     B.forEach(function (b, k) {
       var a = k * 0.62, y = (k - 9.5) * 0.4;
       var s = new THREE.Mesh(new THREE.SphereGeometry(0.4, 24, 16), mat('c' + b[0])); s.position.set(Math.cos(a) * 3.4, y, Math.sin(a) * 3.4); g.add(s);
-      addItem(4, s, '#' + (k + 1) + ' ' + b[1], 'Cause: ' + b[2] + ' Fix: ' + b[3]); spheres.push(s);
-      label(4, String(k + 1), s, 0, null);
+      addItem(i, s, '#' + (k + 1) + ' ' + b[1], 'Cause: ' + b[2] + ' Fix: ' + b[3]); spheres.push(s);
+      label(i, String(k + 1), s, 0, null);
     });
     var cols = ['c0', 'c1', 'c2', 'c3', 'c4', 'c5'];
     var legend = '<ul class="legend">' + cats.map(function (c, k) { return '<li><i style="background:var(--c' + k + ')"></i>' + c + '</li>'; }).join('') + '</ul>';
@@ -290,39 +419,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       cam: [0, 1.5, 18], tgt: [0, 0, 0], g: g,
       update: function (t) { g.rotation.y = t * 0.12; }
     };
-  })(4));
+  })(8));
 
-  /* ---------- SLIDE 5: chronology ---------- */
-  slides.push((function (i) {
-    var g = new THREE.Group(); var pil = [];
-    var D = [
-      ['Oct 5', 6, 'Repo bana, GitHub Actions ARM64 build workflow.'],
-      ['Oct 6', 0, 'Koi commit nahi.'],
-      ['Oct 7', 9, 'Hardware: EFUSE/MAC, firmware download rev 28.0, 507-write init replay, passive aur active scan, TX power.'],
-      ['Oct 8', 37, 'WiFiCx skeleton. Bahut saare CI probe commits (WDK headers dump), phir real BSS scan results.'],
-      ['Oct 9', 17, 'Open-network join, association result fix, data path, Linux usbmon capture, post-association registers.'],
-      ['Oct 10', 23, 'WPA2 CCMP, native 802.11 datapath, RSSI auto-rate, ADDBA response, link-loss, reconnect test.'],
-      ['Oct 11', 9, 'Async pipelined TX, USB TX aggregation (gain nahi, off), x86 USBPcap capture script, HT40 regs.'],
-      ['Oct 12', 16, 'HT40 + DescMask bisect, RX ring 512, update.ps1, TX A-MPDU (upload 35-37), TX queue 1024, test harness fixes.'],
-      ['Oct 13', 14, 'EAPOL ring + eapol.ps1, EAPOL 6M OFDM fix, RX wakeup guard, stats timer fix, docs.']
-    ];
-    var base = box(19, 0.1, 3, 'dim', { transparent: true, opacity: 0.5 }); base.position.set(0, -0.05, 0); g.add(base);
-    D.forEach(function (d, k) {
-      var x = (k - 4) * 2.1, h = Math.max(0.06, d[1] * 0.13);
-      var m = box(1.2, h, 1.2, d[1] === 0 ? 'dim' : 'accent'); m.geometry.translate(0, h / 2, 0); m.position.set(x, 0, 0); edges(m, 'fg', 0.3); g.add(m); pil.push(m);
-      addItem(5, m, d[0] + ': ' + d[1] + ' commits', d[2]);
-      var a = new THREE.Object3D(); a.position.set(x, 0, 1.1); g.add(a); label(5, d[0], a, 0, 'sm');
-      var c = new THREE.Object3D(); c.position.set(x, h + 0.5, 0); g.add(c); label(5, String(d[1]), c, 0, 'big');
-    });
-    return {
-      kick: 'Chronology', title: '131 commits, 9 din',
-      body: '<p>Har pillar ek din ke commits hai. Oct 8 sabse bhaari raha, kyunki WiFiCx ke headers aur structs undocumented the aur CI se dump karne pade.</p><p class="m">Pillar par click karo, us din ka kaam padho.</p>',
-      cam: [0, 5.2, 23], tgt: [0, 2.2, 0], g: g,
-      update: function (t, te) { pil.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.08) / 0.8)); }); }
-    };
-  })(5));
-
-  /* ---------- SLIDE 6: methodology ---------- */
+  /* ---------- slide 9 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var ring = new THREE.Group(); g.add(ring);
     var S = [
@@ -340,8 +439,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     S.forEach(function (s, k) {
       var a = (k / S.length) * Math.PI * 2 - Math.PI / 2, x = Math.cos(a) * 4.6, z = Math.sin(a) * 4.6;
       var m = box(1.3, 1.3, 1.3, 'c' + (k % 6 === 4 ? 4 : (k % 3))); m.position.set(x, 0, z); m.rotation.y = -a; edges(m, 'fg', 0.4); ring.add(m);
-      addItem(6, m, (k + 1) + '. ' + s[0], s[1]); pts.push(new THREE.Vector3(x, 0, z));
-      label(6, String(k + 1), m, 0, 'big');
+      addItem(i, m, (k + 1) + '. ' + s[0], s[1]); pts.push(new THREE.Vector3(x, 0, z));
+      label(i, String(k + 1), m, 0, 'big');
     });
     pts.push(pts[0].clone());
     ring.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), lmat('mesh', 0.5)));
@@ -352,13 +451,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       cam: [0, 7.5, 11.5], tgt: [0, 0, 0], g: g,
       update: function (t) { ring.rotation.y = t * 0.1; core.rotation.x = t * 0.4; core.rotation.y = t * 0.55; }
     };
-  })(6));
+  })(9));
 
-  /* ---------- SLIDE 7: open problem ---------- */
+  /* ---------- slide 10 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group();
     var core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.1, 1), mat('warn')); g.add(core);
-    label(7, '11006 key exchange failed', core, 34, null);
+    label(i, '11006 key exchange failed', core, 34, null);
     var H = [
       ['Windows RX queue drain nahi ho rahi', 'Ring full (RxRingDrop), notification re-arm nahi hua. Driver ne msg1 log kiya, Windows ne msg2 nahi bheja.'],
       ['Queue cancel hui, recreate nahi', 'EvtRxCancel RxQueue=nullptr karta hai; naya queue na bane to koi notification fire nahi hoga.'],
@@ -369,8 +468,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     H.forEach(function (h, k) {
       var a = -Math.PI * 0.85 + k * (Math.PI * 1.7 / 3);
       var m = new THREE.Mesh(new THREE.OctahedronGeometry(0.75), mat('c3')); m.position.set(Math.cos(a) * 4.6, 0.2 + (k % 2) * 0.6, Math.sin(a) * 2.6 - 1); g.add(m); orbs.push(m);
-      addItem(7, m, 'Hypothesis ' + (k + 1) + ': ' + h[0], h[1] + ' (proven nahi)');
-      label(7, 'H' + (k + 1), m, 0, 'big');
+      addItem(i, m, 'Hypothesis ' + (k + 1) + ': ' + h[0], h[1] + ' (proven nahi)');
+      label(i, 'H' + (k + 1), m, 0, 'big');
       g.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), m.position.clone()]), lmat('mesh', 0.35)));
     });
     return {
@@ -379,9 +478,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       cam: [0, 4, 13.5], tgt: [0, 0.2, -0.5], g: g,
       update: function (t) { core.rotation.x = t * 0.5; core.rotation.y = t * 0.7; core.scale.setScalar(1 + Math.sin(t * 2.4) * 0.06); orbs.forEach(function (o, k) { o.rotation.y = t * 0.6 + k; o.position.y = 0.2 + (k % 2) * 0.6 + Math.sin(t + k) * 0.15; }); }
     };
-  })(7));
+  })(10));
 
-  /* ---------- SLIDE 8: handoff ---------- */
+  /* ---------- slide 11 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var docs = [];
     var F = [
@@ -391,8 +490,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     ];
     F.forEach(function (f, k) {
       var m = box(2.8, 3.6, 0.22, f[1]); m.position.set((k - 1) * 3.6, 0, 0); edges(m, 'fg', 0.45); g.add(m); docs.push(m);
-      addItem(8, m, f[0], f[2]);
-      var o = new THREE.Object3D(); o.position.set((k - 1) * 3.6, -2.4, 0); g.add(o); label(8, f[0], o, 0, 'sm');
+      addItem(i, m, f[0], f[2]);
+      var o = new THREE.Object3D(); o.position.set((k - 1) * 3.6, -2.4, 0); g.add(o); label(i, f[0], o, 0, 'sm');
     });
     return {
       kick: 'Handoff', title: 'Agla agent isi se shuru kare',
@@ -400,7 +499,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       cam: [0, 1.2, 13], tgt: [0, 0, 0], g: g,
       update: function (t) { docs.forEach(function (d, k) { d.rotation.y = Math.sin(t * 0.5 + k * 1.3) * 0.3; d.position.y = Math.sin(t * 0.8 + k) * 0.15; }); }
     };
-  })(8));
+  })(11));
 
   /* ---------- deck plumbing ---------- */
   var N = slides.length, SP = 80, cur = 0, enter = 0, selected = null;
@@ -471,7 +570,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     camPos.lerp(wp, k); camTgt.lerp(new THREE.Vector3(cur * SP + s.tgt[0], s.tgt[1], s.tgt[2]), k);
     camera.position.copy(camPos); camera.lookAt(camTgt);
     slides.forEach(function (sl, idx) { if (Math.abs(idx - cur) <= 1) sl.update(t, idx === cur ? enter : 99); });
-    items.forEach(function (m) { if (m !== selected && m.userData.slide === cur) { var tgt = (m === hover) ? 1.08 : 1; m.scale.x += (m.userData.base.x * tgt - m.scale.x) * 0.2; m.scale.z += (m.userData.base.z * tgt - m.scale.z) * 0.2; if (m.userData.slide !== 1 && m.userData.slide !== 5) m.scale.y += (m.userData.base.y * tgt - m.scale.y) * 0.2; } });
+    items.forEach(function (m) { if (m !== selected && m.userData.slide === cur) { var tgt = (m === hover) ? 1.08 : 1; m.scale.x += (m.userData.base.x * tgt - m.scale.x) * 0.2; m.scale.z += (m.userData.base.z * tgt - m.scale.z) * 0.2; if (!m.userData.bar) m.scale.y += (m.userData.base.y * tgt - m.scale.y) * 0.2; } });
     renderer.render(scene, camera);
     var w = innerWidth, h = innerHeight;
     labels.forEach(function (L) {

@@ -274,6 +274,42 @@ slides.push((function (i) {
 })(4));
 
 /* ---------- slide 5 ---------- */
+slides.push((function (i) {
+  var g = new THREE.Group();
+  var GN = ['Install + CI', 'Speed tests', 'Diagnose', 'Capture'];
+  var T = [
+    [0, 'update.ps1', 'Ek command: latest zip download, Wi-Fi profiles backup, purana driver delete, cert Root + TrustedPublisher, pnputil install, profiles restore, connect, test. Output: Desktop txt + transcript log.'],
+    [0, 'CI build-driver-v4', 'windows-2022: MSBuild ARM64, stampinf, Inf2Cat, signtool, self-signed cert, release "latest". Har push par ~50 s.'],
+    [0, 'probe-wdk.yml', 'WDK 10.0.26100 headers (km/wlan/2.0) ke struct aur function signatures notice/artifact mein dump. Undocumented WiFiCx ke liye.'],
+    [1, 'test_ampdu / test_pipe', '4 parallel curl.exe, download + upload, A-MPDU off/on, pipeline counters. Output ampdu.txt / pipe.txt. Final: down 36-38.9, up 35-37 Mbps.'],
+    [1, 'test_ht40', '6 descriptor/HT40 variants, har ek mein reconnect, ping, speed. Full real descriptor = 3 Mbps; best mask 0x1C.'],
+    [1, 'test_qos', 'QoS data TX variants. Upload 15-25 vs real 41; QoS akela default nahi bana.'],
+    [1, 'test_agg', 'USB TX aggregation positions (dword5/dword7). Koi gain nahi, off.'],
+    [1, 'test_dlcpu', 'Download ke dauran CPU + RX counters. 1148 RX ring drops, isliye ring 64 se 512.'],
+    [1, 'test_speed', 'Cfg_Ba 1 vs 0 A/B (AP ADDBA accept).'],
+    [2, 'diag_conn', 'Connect, netsh disconnect, reconnect; phase 1 LinkState=0, phase 2 =1; Log_* before/after. JoinRuns 5/6 vs 3.'],
+    [2, 'diag_now', 'Snapshot: state, IP, Log_Dp/Key/Join/D0 counters, WLAN + DHCP events. Failure live ho tab chalao.'],
+    [2, 'timeline', 'WLAN + DHCP + NLA + profile events ek timeline mein. Dikhaya: security har ~6 s restart.'],
+    [2, 'eapol', 'Driver EAPOL ring decode + Windows events merge (boot-time offset). msg1-msg4 pairs, 6 s loop, missing msg2.'],
+    [2, 'test_reconnect', 'Adapter disable/enable, phir router power-off, 4 minute tak har 10 s state log (reconnect2.txt).'],
+    [3, 'capture_x86 + linux_capture', 'USBPcap automation (x86 Windows, vendor driver) aur usbmon capture (Linux). Init tables, descriptors, post-association registers.']
+  ];
+  var cubes = [];
+  T.forEach(function (t, k) {
+    var c = k % 5, r = Math.floor(k / 5);
+    var m = new THREE.Mesh(new THREE.OctahedronGeometry(0.85), mat('c' + [0, 3, 2, 1][t[0]])); m.position.set((c - 2) * 2.4, (1 - r) * 2.3, 0); g.add(m); cubes.push(m);
+    addItem(i, m, t[1], t[2]); label(i, t[1], m, 58, 'sm');
+  });
+  var lg = '<ul class="legend">' + GN.map(function (n, k) { return '<li><i style="background:var(--c' + [0, 3, 2, 1][k] + ')"></i>' + n + '</li>'; }).join('') + '</ul>';
+  return {
+    kick: 'Scripts', title: 'Kaun si script, kya chali',
+    body: '<p>Har script ek sawal ka jawab deti hai aur ek txt file likhti hai jo user attach karta hai. AI side: Bash, git, gh, Edit, headless Chromium; cloud: GitHub Actions.</p>' + lg + '<p class="m">Octahedron par click karo.</p>',
+    cam: [0, 3, 17.5], tgt: [0, 0.4, 0], g: g,
+    update: function (t) { cubes.forEach(function (m, k) { m.rotation.y = t * 0.5 + k; m.position.y = ((1 - Math.floor(k / 5)) * 2.3) + Math.sin(t * 0.9 + k * 0.7) * 0.1; }); }
+  };
+})(5));
+
+/* ---------- slide 6 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var pil = [];
     var D = [
@@ -301,9 +337,9 @@ slides.push((function (i) {
       cam: [0, 5.2, 23], tgt: [0, 2.2, 0], g: g,
       update: function (t, te) { pil.forEach(function (b, k) { b.scale.y = Math.max(0.001, ease((te - k * 0.08) / 0.8)); }); }
     };
-  })(5));
+  })(6));
 
-  /* ---------- slide 6 ---------- */
+  /* ---------- slide 7 ---------- */
 slides.push((function (i) {
   var g = new THREE.Group();
   var S = [
@@ -332,9 +368,9 @@ slides.push((function (i) {
     cam: [0, 2.6, 18], tgt: [0, 1.6, 0], g: g,
     update: function (t) { nodes.forEach(function (m, k) { m.position.y = pts[k].y + Math.sin(t * 0.9 + k) * 0.08; }); }
   };
-})(6));
+})(7));
 
-/* ---------- slide 7 ---------- */
+/* ---------- slide 8 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var mode = 'before';
     var nodes = [
@@ -376,9 +412,9 @@ slides.push((function (i) {
         var ok = (mode === 'after' && idx === 3 && p > 0.96); if (ok) flash = 1; flash = Math.max(0, flash - 0.02); ap.scale.setScalar(1 + flash * 0.25);
       }
     };
-  })(7));
+  })(8));
 
-  /* ---------- slide 8 ---------- */
+  /* ---------- slide 9 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group();
     var cats = ['Build / CI', 'WiFiCx API', 'Data path', 'RF / speed', 'Tooling', 'Connect'];
@@ -419,9 +455,9 @@ slides.push((function (i) {
       cam: [0, 1.5, 18], tgt: [0, 0, 0], g: g,
       update: function (t) { g.rotation.y = t * 0.12; }
     };
-  })(8));
+  })(9));
 
-  /* ---------- slide 9 ---------- */
+  /* ---------- slide 10 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var ring = new THREE.Group(); g.add(ring);
     var S = [
@@ -451,9 +487,9 @@ slides.push((function (i) {
       cam: [0, 7.5, 11.5], tgt: [0, 0, 0], g: g,
       update: function (t) { ring.rotation.y = t * 0.1; core.rotation.x = t * 0.4; core.rotation.y = t * 0.55; }
     };
-  })(9));
+  })(10));
 
-  /* ---------- slide 10 ---------- */
+  /* ---------- slide 11 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group();
     var core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.1, 1), mat('warn')); g.add(core);
@@ -478,9 +514,9 @@ slides.push((function (i) {
       cam: [0, 4, 13.5], tgt: [0, 0.2, -0.5], g: g,
       update: function (t) { core.rotation.x = t * 0.5; core.rotation.y = t * 0.7; core.scale.setScalar(1 + Math.sin(t * 2.4) * 0.06); orbs.forEach(function (o, k) { o.rotation.y = t * 0.6 + k; o.position.y = 0.2 + (k % 2) * 0.6 + Math.sin(t + k) * 0.15; }); }
     };
-  })(10));
+  })(11));
 
-  /* ---------- slide 11 ---------- */
+  /* ---------- slide 12 ---------- */
   slides.push((function (i) {
     var g = new THREE.Group(); var docs = [];
     var F = [
@@ -499,7 +535,7 @@ slides.push((function (i) {
       cam: [0, 1.2, 13], tgt: [0, 0, 0], g: g,
       update: function (t) { docs.forEach(function (d, k) { d.rotation.y = Math.sin(t * 0.5 + k * 1.3) * 0.3; d.position.y = Math.sin(t * 0.8 + k) * 0.15; }); }
     };
-  })(11));
+  })(12));
 
   /* ---------- deck plumbing ---------- */
   var N = slides.length, SP = 80, cur = 0, enter = 0, selected = null;

@@ -45,20 +45,21 @@ if (-not (Test-Path $cf)) {
 }
 
 # tunnel config
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 Set-Content (Join-Path $dir 'mode.txt') $mode -Encoding ASCII
 if ($mode -eq 'named') {
     $cfTokFile = Join-Path $dir 'cf_token.txt'
     Set-Content $cfTokFile $CfToken -Encoding ASCII
-    & icacls.exe $cfTokFile /inheritance:r /grant:r "$($env:USERDOMAIN)\$($env:USERNAME):(R)" 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+    & icacls.exe $cfTokFile /inheritance:r /grant:r "$($user):(R)" 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
     Set-Content (Join-Path $dir 'hostname.txt') $CfHostname -Encoding ASCII
 }
 Remove-Item (Join-Path $dir 'tunnel.log') -ErrorAction SilentlyContinue
 
 # scheduled tasks
-$user = "$env:USERDOMAIN\$env:USERNAME"
-$princ = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name   # e.g. PCNAME\go (USERDOMAIN is unreliable over SSH)
+$princ = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest
 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
-$trig = New-ScheduledTaskTrigger -AtLogOn -User $user
+$trig = New-ScheduledTaskTrigger -AtStartup
 foreach ($t in @(@{ n = 'PCMCP-Server'; f = 'server.ps1' }, @{ n = 'PCMCP-Tunnel'; f = 'run-tunnel.ps1' })) {
     Stop-ScheduledTask -TaskName $t.n -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $t.n -Confirm:$false -ErrorAction SilentlyContinue

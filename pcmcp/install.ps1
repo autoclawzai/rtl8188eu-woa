@@ -8,7 +8,7 @@ param([string]$CfToken, [string]$CfHostname, [int]$Port = 8787, [string]$Ref = '
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$raw = 'https://raw.githubusercontent.com/autoclawzai/rtl8188eu-woa/$Ref/pcmcp'
+$raw = "https://raw.githubusercontent.com/autoclawzai/rtl8188eu-woa/$Ref/pcmcp"
 $dir = Join-Path $env:ProgramData 'pcmcp'
 $ua = 'Mozilla/5.0'
 

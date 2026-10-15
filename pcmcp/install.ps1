@@ -45,26 +45,37 @@ if (-not (Test-Path $cf)) {
 }
 
 # tunnel config
-$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 Set-Content (Join-Path $dir 'mode.txt') $mode -Encoding ASCII
 if ($mode -eq 'named') {
     $cfTokFile = Join-Path $dir 'cf_token.txt'
     Set-Content $cfTokFile $CfToken -Encoding ASCII
-    & icacls.exe $cfTokFile /inheritance:r /grant:r "$($user):(R)" 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+    & icacls.exe $cfTokFile /inheritance:r /grant:r "*$($sid):(R)" 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
     Set-Content (Join-Path $dir 'hostname.txt') $CfHostname -Encoding ASCII
 }
 Remove-Item (Join-Path $dir 'tunnel.log') -ErrorAction SilentlyContinue
 
-# scheduled tasks
-$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name   # e.g. PCNAME\go (USERDOMAIN is unreliable over SSH)
-$princ = New-ScheduledTaskPrincipal -UserId $user -LogonType S4U -RunLevel Highest
+# scheduled tasks. The account name from SSH can be unmappable (WORKGROUP\go), so try SID, COMPUTER\user, plain name, finally SYSTEM.
+$ident = [Security.Principal.WindowsIdentity]::GetCurrent()
+Set-Content (Join-Path $dir 'desk.txt') (Join-Path $env:USERPROFILE 'Desktop') -Encoding ASCII
+$cands = @(
+    @{ id = $ident.User.Value; type = 'S4U' }, @{ id = "$env:COMPUTERNAME\$env:USERNAME"; type = 'S4U' }, @{ id = $env:USERNAME; type = 'S4U' },
+    @{ id = 'SYSTEM'; type = 'ServiceAccount' })
 $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)
 $trig = New-ScheduledTaskTrigger -AtStartup
 foreach ($t in @(@{ n = 'PCMCP-Server'; f = 'server.ps1' }, @{ n = 'PCMCP-Tunnel'; f = 'run-tunnel.ps1' })) {
     Stop-ScheduledTask -TaskName $t.n -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $t.n -Confirm:$false -ErrorAction SilentlyContinue
     $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $dir $t.f)`" -Port $Port"
-    Register-ScheduledTask -TaskName $t.n -Action $act -Trigger $trig -Principal $princ -Settings $set | Out-Null
+    $done = $false
+    foreach ($c in $cands) {
+        try {
+            $princ = New-ScheduledTaskPrincipal -UserId $c.id -LogonType $c.type -RunLevel Highest
+            Register-ScheduledTask -TaskName $t.n -Action $act -Trigger $trig -Principal $princ -Settings $set -ErrorAction Stop | Out-Null
+            Write-Host "$($t.n): registered as $($c.id)"; $done = $true; break
+        } catch { Write-Host "$($t.n): account '$($c.id)' failed: $($_.Exception.Message.Trim())" }
+    }
+    if (-not $done) { throw "Could not register $($t.n)" }
     Start-ScheduledTask -TaskName $t.n
 }
 

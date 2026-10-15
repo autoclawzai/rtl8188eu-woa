@@ -4,7 +4,8 @@ $cf = Join-Path $Dir 'cloudflared.exe'
 $mode = (Get-Content (Join-Path $Dir 'mode.txt') -Raw).Trim()
 $log = Join-Path $Dir 'tunnel.log'
 $tok = (Get-Content (Join-Path $Dir 'token.txt') -Raw).Trim()
-$desk = Join-Path $env:USERPROFILE 'Desktop\pcmcp_url.txt'
+$deskDir = (Get-Content (Join-Path $Dir 'desk.txt') -Raw).Trim()
+$desk = Join-Path $deskDir 'pcmcp_url.txt'
 
 if ($mode -eq 'quick') {
     # watcher: publish the URL whenever cloudflared prints a new one

@@ -4,11 +4,11 @@
 #   (Zero Trust > Networks > Tunnels > create tunnel > copy token; add Public hostname -> HTTP -> localhost:8787)
 # Mode B (no account, URL changes after every restart):
 #   install.ps1
-param([string]$CfToken, [string]$CfHostname, [int]$Port = 8787)
+param([string]$CfToken, [string]$CfHostname, [int]$Port = 8787, [string]$Ref = 'main')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$raw = 'https://raw.githubusercontent.com/autoclawzai/rtl8188eu-woa/main/pcmcp'
+$raw = 'https://raw.githubusercontent.com/autoclawzai/rtl8188eu-woa/$Ref/pcmcp'
 $dir = Join-Path $env:ProgramData 'pcmcp'
 $ua = 'Mozilla/5.0'
 

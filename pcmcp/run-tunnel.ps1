@@ -15,7 +15,7 @@ if ($mode -eq 'quick') {
         while ($true) {
             Start-Sleep -Seconds 5
             if (Test-Path $log) {
-                $m = [regex]::Matches((Get-Content $log -Raw -ErrorAction SilentlyContinue), 'https://[a-z0-9-]+\.trycloudflare\.com')
+                $m = [regex]::Matches(([string](Get-Content $log -Raw -ErrorAction SilentlyContinue)), 'https://[a-z0-9-]+\.trycloudflare\.com')
                 if ($m.Count -gt 0) {
                     $u = $m[$m.Count - 1].Value
                     if ($u -ne $last) { Set-Content $desk "$u/mcp/$tok" -Encoding ASCII; $last = $u }

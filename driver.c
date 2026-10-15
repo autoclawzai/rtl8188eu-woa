@@ -207,6 +207,7 @@ typedef struct _DEVICE_CONTEXT {
     UCHAR           JoinExtIe[256];
     ULONG           JoinExtIeLen;
     USHORT          JoinAid, JoinStatus, JoinCap, LossReason;
+    ULONG           LossN, LossMs, LossInfo, LossAddr;
     UCHAR           AssocReq[420];
     ULONG           AssocReqLen;
     UCHAR           AssocResp[420];
@@ -2083,6 +2084,11 @@ static VOID EvtLossWork(WDFWORKITEM wi)
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     if (c->Stopping) return;
+    c->LossN++;
+    RegLog(dev, L"Log_Loss_N", c->LossN);
+    RegLog(dev, L"Log_Loss_Info", c->LossInfo);     /* subtype<<16 | reason (10=disassoc, 12=deauth) */
+    RegLog(dev, L"Log_Loss_Ms", c->LossMs);          /* ms after join-up */
+    RegLog(dev, L"Log_Loss_Addr", c->LossAddr);      /* RA[4..5] TA[4..5] */
     if (c->HwReady) Join_HwDown(c);
     WifiCx_OnLinkLost(dev, c->LossReason);
 }
@@ -2210,6 +2216,9 @@ static VOID Rx_Frame(PDEVICE_CONTEXT c, const UCHAR *f, ULONG len, ULONG v0)
             if (c->TxAmpdu == 2 && (((f[27] >> 4) & 0xF) == 0) && !(f[27] & 0x08)) c->TxAmpdu = 0;
         } else if ((sub == 12 || sub == 10) && state == JOIN_UP && len >= 26) {
             c->LossReason = Le16(f + 24);
+            c->LossMs = (ULONG)(KeQueryInterruptTime() / 10000 - c->UpMs);
+            c->LossInfo = ((ULONG)sub << 16) | Le16(f + 24);
+            c->LossAddr = ((ULONG)f[4] << 24) | ((ULONG)f[5] << 16) | ((ULONG)f[10] << 8) | f[11];   /* RA tail + TA tail */
             if (InterlockedCompareExchange(&c->JoinState, JOIN_IDLE, JOIN_UP) == JOIN_UP)
                 WdfWorkItemEnqueue(c->LossWork);
         }

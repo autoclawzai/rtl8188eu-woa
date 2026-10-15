@@ -72,6 +72,7 @@ typedef struct _WIFI_CTX {
     LONG        CmdCount;
     LONG        LastMsgId;
     volatile LONG ScanTaskCount;
+    volatile LONG ConnTaskCount, DiscTaskCount, ConnRejCount;
     volatile LONG ScanPending;      /* a WDI scan task waits for its M4 */
     WDI_MESSAGE_HEADER ScanHdr;     /* header of that task */
     /* phase 5d */
@@ -272,8 +273,10 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
             WifiRequestComplete(Request, st, sizeof(WDI_MESSAGE_HEADER));
             return;
         }
+        WLog(Device, L"Log_Wifi_ConnTasks", (ULONG)InterlockedIncrement(&ctx->ConnTaskCount));
         if (p.PreferredBSSEntryList.ElementCount == 0 ||
             InterlockedCompareExchange(&ctx->ConnPending, 1, 0) != 0) {
+            WLog(Device, L"Log_Wifi_ConnRej", (ULONG)InterlockedIncrement(&ctx->ConnRejCount));
             CleanupParsedWdiTaskConnectToIhv(&p);
             WifiRequestComplete(Request, STATUS_INVALID_DEVICE_STATE, sizeof(WDI_MESSAGE_HEADER));
             return;
@@ -282,6 +285,9 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
         const WDI_CONNECT_BSS_ENTRY_CONTAINER& e = p.PreferredBSSEntryList.pElements[0];
         UCHAR bssid[6], ssid[32], ssidLen = 0, ch = (UCHAR)e.ChannelInfo.ChannelNumber;
         RtlCopyMemory(bssid, e.BSSID.Address, 6);
+        WLog(Device, L"Log_Wifi_ConnBssidHi", ((ULONG)bssid[0] << 24) | ((ULONG)bssid[1] << 16) | ((ULONG)bssid[2] << 8) | bssid[3]);
+        WLog(Device, L"Log_Wifi_ConnBssidLo", ((ULONG)bssid[4] << 8) | bssid[5]);
+        WLog(Device, L"Log_Wifi_ConnListCnt", (ULONG)p.PreferredBSSEntryList.ElementCount);
 
         /* SSID + channel come from the beacon / probe response body (IEs start after ts+interval+cap = 12 bytes) */
         const UINT8* body = nullptr; ULONG bl = 0;
@@ -347,6 +353,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
     }
 
     case WDI_TASK_DISCONNECT:
+        WLog(Device, L"Log_Wifi_DiscTasks", (ULONG)InterlockedIncrement(&ctx->DiscTaskCount));
         WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));      /* M3 */
         ctx->DiscHdr = hdr;
         InterlockedExchange(&ctx->DiscPending, 1);

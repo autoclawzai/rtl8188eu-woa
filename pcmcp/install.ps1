@@ -97,7 +97,7 @@ else {
         Start-Sleep -Seconds 2
         $lf = Join-Path $dir 'tunnel.log'
         if (Test-Path $lf) {
-            $m = [regex]::Match(([string](Get-Content $lf -Raw -ErrorAction SilentlyContinue)), 'https://[a-z0-9-]+\.trycloudflare\.com')
+            $m = [regex]::Match(([string](Get-Content $lf -Raw -ErrorAction SilentlyContinue)), 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com')
             if ($m.Success) { $base = $m.Value }
         }
     }

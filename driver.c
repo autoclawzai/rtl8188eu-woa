@@ -181,6 +181,8 @@ typedef struct _DEVICE_CONTEXT {
     /* phase 5d-B: WPA2 / CCMP via the hardware CAM */
     KEY_REQ         KeyQ[KEYQ_N];
     ULONG           KeyQHead, KeyQTail;
+    volatile LONG   NeedPtk;                /* RSN join: hold back non-EAPOL data until the PTK is installed */
+    volatile LONG   GateDrops;
     volatile LONG   PtkInstalled;           /* TX encrypts data frames when set */
     BOOLEAN         SecOn;
     ULONG64         TxPn;
@@ -1315,6 +1317,10 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     case 7: queue = 0x12; rate = 0; useMgmtPipe = TRUE; break;
     default: break;                                        /* 0, 2: BE / ep 0x03 / 11M (2 = QoS header, built by the producer) */
     }
+    if (!mgmt && c->NeedPtk && !c->PtkInstalled && (frame[0] & 0x0C) == 0x08) {   /* secure join, no PTK yet: only EAPOL may go out */
+        ULONG gh = (frame[0] & 0x80) ? 26 : 24;
+        if (!(fl >= gh + 8 && frame[gh + 6] == 0x88 && frame[gh + 7] == 0x8E)) { InterlockedIncrement(&c->GateDrops); return STATUS_SUCCESS; }
+    }
     pipe = (mgmt || useMgmtPipe) ? c->TxPipe : (c->TxPipeData ? c->TxPipeData : c->TxPipe);
     if (!pipe || fl < 24 || fl > TXQ_BUF) return STATUS_DEVICE_NOT_READY;
     if (!mgmt && (c->QosTx || c->TxAmpdu == 2) && frame[0] == 0x08 && (frame[1] & 3) == 1 && fl >= 32 && fl + 2 <= TXQ_BUF &&
@@ -2086,6 +2092,7 @@ static VOID EvtLossWork(WDFWORKITEM wi)
     if (c->Stopping) return;
     c->LossN++;
     RegLog(dev, L"Log_Loss_N", c->LossN);
+    RegLog(dev, L"Log_Gate_Drops", (ULONG)c->GateDrops);
     RegLog(dev, L"Log_Loss_Info", c->LossInfo);     /* subtype<<16 | reason (10=disassoc, 12=deauth) */
     RegLog(dev, L"Log_Loss_Ms", c->LossMs);          /* ms after join-up */
     RegLog(dev, L"Log_Loss_Addr", c->LossAddr);      /* RA[4..5] TA[4..5] */
@@ -2317,6 +2324,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     c->RssiCck = c->RssiOfdm = 0; c->RssiNCck = c->RssiNOfdm = 0; RtlZeroMemory(c->PickN, sizeof(c->PickN));
     c->JoinCh = ch;
     c->JoinExtIeLen = extIeLen;
+    { ULONG o; LONG need = 0; for (o = 0; o + 2 <= extIeLen && o + 2 + extIe[o + 1] <= extIeLen; o += 2 + extIe[o + 1]) if (extIe[o] == 48) need = 1; InterlockedExchange(&c->NeedPtk, need); }
     if (extIeLen) RtlCopyMemory(c->JoinExtIe, extIe, extIeLen);
     c->AssocReqLen = c->AssocRespLen = 0;
     c->JoinAid = 0;

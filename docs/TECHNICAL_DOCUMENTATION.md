@@ -161,12 +161,14 @@ Logs: `Log_Join_*`, `Log_Key_*`, `Log_Dp_*` (data path: TxQCreated/RxQCreated, T
 | 17 | Possible lost RX wakeup delaying msg1 | arm after drain race | `EvtRxNotify` guard + `WifiCx_ResetRx` on connect |
 | 18 | AP restarted the 4-way handshake every ~6 s (3–11 cycles, ~40 s before internet) | msg4 sent as data frame with MCS/BW40/SGI/AGG/fallback right while PTK installs; AP did not accept it | EAPOL sent at 6M OFDM with a plain descriptor (`Cfg_EapolLow`) → 3 of 4 test reconnects clean |
 | 19 | Cosmetic "Authentication: Unknown" (event 8001) | WDI auth algorithm reporting | judged cosmetic, not fixed |
+| 20 | Connect/reconnect loop: 4-way handshake restarted again and again (event 11006), 15 of 30 stress cycles failed, 12-18 joins per connect | Driver sent ARP/DHCP/IGMP data frames unencrypted right after association, before the PTK was installed. The AP answered with deauth reason 1 about 100 ms after join; the driver reported the link lost, Windows issued a new WDI_TASK_CONNECT (ConnTasks == Join_Runs), and the loop fed itself | `NeedPtk` gate in `Tx_Raw`: on an RSN join only EAPOL leaves the radio until the PTK is installed (`GateDrops` counter). Result: 20 of 20 cycles OK, exactly 1 join per cycle, holds up to 240 s without loss |
 
 ---------------------------------------------------------------------------------------------------
 
 ## 6. Open problems and next steps
 
-### 6.1 Intermittent "can't connect" after minutes of use (OPEN)
+### 6.1 Intermittent "can't connect" (RESOLVED 2026-10-16, see bug 20)
+The symptoms below were the pre-PTK data frames triggering AP deauths (reason 1) and Windows reconnect loops, not a stuck RX queue. Kept for history.
 Observed (17:48–17:50 test): association status 0 every time, AP sends msg1 (rc=1..4 once per second), driver logs the RX, **no TX msg2 is ever logged** (so Windows never got/answered msg1), then `11006 key exchange failed`. In an earlier window no msg1 was logged at all.
 Hypotheses (unproven): (a) Windows NetRxQueue stopped being drained (ring full → `RxRingDrop`; notification never re-armed); (b) data path queues cancelled/recreated (EvtRxCancel sets `RxQueue=nullptr` — no notification can fire if a new queue is not created); (c) device idle / D0 cycle (selective suspend) leaving hardware state stale; (d) CAM/security state not reset after a long session.
 The stats timer previously ran only while `JOIN_UP`, so the stuck period was never captured. **Now fixed:** timer runs whenever HW is ready, and `diag_now.ps1` prints `Log_D0*`.

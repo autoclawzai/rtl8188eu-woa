@@ -2725,6 +2725,18 @@ NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)
     WifiCx_Quiesce(dev);
     RegLog(dev, L"Log_SelfSuspend", ctx->D0Count);
     WifiCx_Trace(dev, 0x1002);
+    {
+        POWER_ACTION pa = WdfDeviceGetSystemPowerAction(dev);
+        if (pa == PowerActionShutdown || pa == PowerActionShutdownReset || pa == PowerActionShutdownOff) {
+            /* System shutdown/restart (S5): WifiCx would now delete the port types and NetAdapterCx waits for
+             * WlanSvc to close its WLANSVC_WIFICX handle. WlanSvc is still running at this point and never does,
+             * so the power IRP hangs ~5 min and bugchecks (0x9F, DeletePortTypes). The hardware is already
+             * quiesced above and the machine is going down, so do not enter the port-type teardown. */
+            WifiCx_Trace(dev, 0x1005);
+            RegLog(dev, L"Log_SelfSuspend_Shutdown", (ULONG)pa);
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
     return STATUS_SUCCESS;
 }
 

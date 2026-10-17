@@ -65,6 +65,11 @@ void __cdecl operator delete[](void* p, ULONG_PTR) noexcept { if (p) ExFreePoolW
 /* ------------------------------------------------------------------ */
 #define RX_RING_N 512      /* frames buffered between the USB completion and the NetAdapter rx queue (64 dropped ~1% in a download) */
 typedef struct _WIFI_CTX {
+    /* in-memory trace (readable from a crash dump: search for TrMagic 'RTRC'); registry is useless at shutdown */
+    ULONG       TrMagic;
+    volatile LONG TrPos;
+    ULONG       TrId[64];
+    ULONG       TrMs[64];
     WDFDEVICE   Device;
     TLV_CONTEXT Tlv;
     NETADAPTER  Adapters[5];
@@ -126,6 +131,14 @@ static VOID WLog(WDFDEVICE dev, PCWSTR name, ULONG value)
     WdfRegistryClose(key);
 }
 
+static VOID Trace(PWIFI_CTX ctx, ULONG code)
+{
+    ULONG i = (ULONG)InterlockedIncrement(&ctx->TrPos) & 63;
+    ctx->TrId[i] = code;
+    ctx->TrMs[i] = (ULONG)(KeQueryInterruptTime() / 10000);
+}
+extern "C" VOID WifiCx_Trace(WDFDEVICE Device, ULONG Code) { Trace(GetWifiCtx(Device), Code); }
+
 /* ------------------------------------------------------------------ */
 /* indications                                                         */
 /* ------------------------------------------------------------------ */
@@ -137,6 +150,7 @@ static VOID SendIndication(WDFDEVICE Device, const WDI_MESSAGE_HEADER& Orig, UIN
     WDF_OBJECT_ATTRIBUTES attr;
     SIZE_T total = sizeof(WDI_MESSAGE_HEADER) + TlvSize;
 
+    Trace(GetWifiCtx(Device), 0x8000 | (MessageId & 0x7FFF));
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ParentObject = Device;
     if (!NT_SUCCESS(WdfMemoryCreate(&attr, NonPagedPoolNx, 0, total, &mem, (PVOID*)&buf))) return;
@@ -213,12 +227,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
     ctx->LastMsgId = id;
     WLog(Device, L"Log_Wifi_CmdCount", (ULONG)ctx->CmdCount);
     WLog(Device, L"Log_Wifi_LastCmd", id);
-    {   /* ring of the last 16 WDI command ids + uptime in ms: shows what WlanSvc sent right before a shutdown hang */
-        WCHAR rn[24];
-        ULONG slot = (ULONG)ctx->CmdCount % 16;
-        RtlStringCbPrintfW(rn, sizeof(rn), L"Log_Cmd_I%02u", slot); WLog(Device, rn, id);
-        RtlStringCbPrintfW(rn, sizeof(rn), L"Log_Cmd_T%02u", slot); WLog(Device, rn, (ULONG)(KeQueryInterruptTime() / 10000));
-    }
+    Trace(ctx, id);
 
     switch (id) {
     case WDI_TASK_SET_RADIO_STATE: {
@@ -975,6 +984,7 @@ extern "C" NTSTATUS WifiCx_DeviceInitialize(WDFDEVICE Device)
     st = WdfObjectAllocateContext(Device, &attr, (PVOID*)&ctx);
     if (!NT_SUCCESS(st)) return st;
     ctx->Device = Device;
+    ctx->TrMagic = 0x43525452;      /* 'RTRC' */
     g_WifiDevice = Device;
     KeInitializeSpinLock(&ctx->RxLock);
 

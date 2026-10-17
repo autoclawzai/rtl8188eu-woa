@@ -2713,6 +2713,7 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
 NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)
 {
     PDEVICE_CONTEXT ctx = GetDeviceContext(dev);
+    WifiCx_Trace(dev, 0x1001);
     InterlockedExchange(&ctx->Stopping, 1);
     InterlockedExchange(&ctx->ScanCancel, 1);
     InterlockedExchange(&ctx->JoinState, 0);
@@ -2723,7 +2724,7 @@ NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)
     WdfWorkItemFlush(ctx->ScanWork);
     WifiCx_Quiesce(dev);
     RegLog(dev, L"Log_SelfSuspend", ctx->D0Count);
-    RegLog(dev, L"Log_SelfSuspend_Ms", (ULONG)(KeQueryInterruptTime() / 10000));
+    WifiCx_Trace(dev, 0x1002);
     return STATUS_SUCCESS;
 }
 
@@ -2732,6 +2733,7 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     PDEVICE_CONTEXT ctx = GetDeviceContext(dev);
     UNREFERENCED_PARAMETER(target);
 
+    WifiCx_Trace(dev, 0x1003);
     InterlockedExchange(&ctx->Stopping, 1);
     InterlockedExchange(&ctx->JoinState, 0);
     KeSetEvent(&ctx->JoinEvent, 0, FALSE);

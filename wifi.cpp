@@ -9,6 +9,7 @@
  * Hardware access stays in driver.c (C). This file only touches the framework.
  */
 #include <ntddk.h>
+#include <ntstrsafe.h>
 #include <wdf.h>
 #include <netadaptercx.h>
 #include <netiodef.h>
@@ -212,6 +213,12 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
     ctx->LastMsgId = id;
     WLog(Device, L"Log_Wifi_CmdCount", (ULONG)ctx->CmdCount);
     WLog(Device, L"Log_Wifi_LastCmd", id);
+    {   /* ring of the last 16 WDI command ids + uptime in ms: shows what WlanSvc sent right before a shutdown hang */
+        WCHAR rn[24];
+        ULONG slot = (ULONG)ctx->CmdCount % 16;
+        RtlStringCbPrintfW(rn, sizeof(rn), L"Log_Cmd_I%02u", slot); WLog(Device, rn, id);
+        RtlStringCbPrintfW(rn, sizeof(rn), L"Log_Cmd_T%02u", slot); WLog(Device, rn, (ULONG)(KeQueryInterruptTime() / 10000));
+    }
 
     switch (id) {
     case WDI_TASK_SET_RADIO_STATE: {

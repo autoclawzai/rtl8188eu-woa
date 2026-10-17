@@ -2723,6 +2723,7 @@ NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)
     WdfWorkItemFlush(ctx->ScanWork);
     WifiCx_Quiesce(dev);
     RegLog(dev, L"Log_SelfSuspend", ctx->D0Count);
+    RegLog(dev, L"Log_SelfSuspend_Ms", (ULONG)(KeQueryInterruptTime() / 10000));
     return STATUS_SUCCESS;
 }
 

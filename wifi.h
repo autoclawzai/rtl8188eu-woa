@@ -19,6 +19,7 @@ NTSTATUS WifiCx_SetCapabilities(WDFDEVICE Device, const UCHAR Mac[6]);
 
 /* driver.c -> wifi.cpp: a scan run finished (or was cancelled); completes a pending WDI scan task */
 VOID  WifiCx_OnScanComplete(WDFDEVICE Device);
+VOID  WifiCx_Quiesce(WDFDEVICE Device);
 
 /* wifi.cpp -> driver.c */
 NTSTATUS Rtl_WifiScanRequest(WDFDEVICE Device);

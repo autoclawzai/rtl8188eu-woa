@@ -612,6 +612,22 @@ extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
     }
 }
 
+/* Power-down quiesce: called from EvtDeviceSelfManagedIoSuspend, i.e. BEFORE WifiCx tears the port
+ * types down. Every outstanding WDI task must be completed (M4) so nothing in the OS (WlanSvc/WcmSvc)
+ * keeps waiting on this adapter while NetAdapterCx stops it. */
+extern "C" VOID WifiCx_Quiesce(WDFDEVICE Device)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    if (InterlockedCompareExchange(&ctx->ConnPending, 0, 1) == 1)
+        SendM4(Device, WDI_INDICATION_CONNECT_COMPLETE, ctx->ConnHdr, STATUS_CANCELLED);
+    if (InterlockedCompareExchange(&ctx->ScanPending, 0, 1) == 1)
+        SendM4(Device, WDI_INDICATION_SCAN_COMPLETE, ctx->ScanHdr, STATUS_SUCCESS);
+    if (InterlockedCompareExchange(&ctx->DiscPending, 0, 1) == 1)
+        SendM4(Device, WDI_INDICATION_DISCONNECT_COMPLETE, ctx->DiscHdr, STATUS_SUCCESS);
+    ctx->Connected = FALSE;
+    SetNetLink(Device, FALSE);
+}
+
 /* ------------------------------------------------------------------ */
 /* data path: TX (Ethernet -> driver.c queue), RX (ring -> NetRing)    */
 /* ------------------------------------------------------------------ */

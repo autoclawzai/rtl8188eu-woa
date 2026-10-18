@@ -1852,7 +1852,15 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
         /* HT40 with the secondary channel ABOVE (primary = lower) was never captured from the real driver; on
          * a real AP (ch1, sec above) it made every auth frame go unanswered (Join IO_TIMEOUT, Wi-Fi down).
          * Stay at 20 MHz there unless explicitly enabled (Cfg_Ht40Plus=1) for experiments. */
-        if (sec == 1 && !RegGetUlong(dev, L"Cfg_Ht40Plus", 0)) sec = 0;
+        if (sec == 1) {
+            /* HT40+: join (auth/assoc) at 20 MHz like the real driver, switch to 40 MHz only once associated */
+            if (RegGetUlong(dev, L"Cfg_Ht40Plus", 0)) {
+                c->Bw40Primary = c->JoinCh; c->Bw40Minus = 0; c->Bw40Center = (UCHAR)(c->JoinCh + 2);
+                InterlockedExchange(&c->Bw40Want, 1);
+                RegLog(dev, L"Log_Ht40_PlusDeferred", 1);
+            }
+            sec = 0;
+        }
         if (sec) {
             NTSTATUS bs = Rtl_Bw40Apply(c, c->JoinCh, (BOOLEAN)(sec == 3));
             RegLog(dev, L"Log_Ht40_Status", (ULONG)bs);
@@ -1898,6 +1906,11 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     c->UpMs = KeQueryInterruptTime() / 10000;
     c->DbgTxN = c->DbgRxN = 0; c->TxAll = 0; RtlZeroMemory(c->TxCls, sizeof(c->TxCls)); c->TxFirstMs = c->TxLastMs = 0;
     InterlockedExchange(&c->JoinState, JOIN_UP);
+    if (c->Bw40Want && !c->Bw40Active) {          /* deferred HT40+ (see above) */
+        NTSTATUS bs = Rtl_TxChannelSetup(c, c->Bw40Primary);
+        if (NT_SUCCESS(bs)) bs = Rtl_Bw40Apply(c, c->Bw40Primary, (BOOLEAN)c->Bw40Minus);
+        RegLog(dev, L"Log_Ht40_PlusApply", (ULONG)bs);
+    }
     WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     Join_SelfTest(dev, c);
     return STATUS_SUCCESS;

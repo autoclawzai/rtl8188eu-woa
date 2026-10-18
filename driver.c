@@ -1849,6 +1849,10 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
     if (c->Ht40Cfg) {
         UCHAR sec = Join_ApSecondary(c);
         RegLog(dev, L"Log_Ht40_ApSec", sec);
+        /* HT40 with the secondary channel ABOVE (primary = lower) was never captured from the real driver; on
+         * a real AP (ch1, sec above) it made every auth frame go unanswered (Join IO_TIMEOUT, Wi-Fi down).
+         * Stay at 20 MHz there unless explicitly enabled (Cfg_Ht40Plus=1) for experiments. */
+        if (sec == 1 && !RegGetUlong(dev, L"Cfg_Ht40Plus", 0)) sec = 0;
         if (sec) {
             NTSTATUS bs = Rtl_Bw40Apply(c, c->JoinCh, (BOOLEAN)(sec == 3));
             RegLog(dev, L"Log_Ht40_Status", (ULONG)bs);

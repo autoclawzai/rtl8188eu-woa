@@ -205,7 +205,7 @@ typedef struct _DEVICE_CONTEXT {
     volatile LONG   EapolN; LONG EapolLogged; ULONG EapolT[128], EapolI[128];   /* EAPOL timeline: ms since boot / dir<<31 | keyinfo<<8 | replay counter low byte */
     ULONG           Ht40Cfg, DescMask, EapolLow;       /* Cfg_Ht40 (0/1), Cfg_DescMask: 1=16B pad+d1 bit27, 2=AGG_EN/density, 4=BW40 bit, 8=SGI, 16=fallback d6/d7, 32=CTS-self d4 */
     volatile LONG   Bw40Active, Bw40Want;    /* radio currently in HT40 / should be in HT40 while associated */
-    UCHAR           Bw40Primary, Bw40Minus, Bw40Center;
+    UCHAR           Bw40Primary, Bw40Minus, Bw40Center, TxSc40;
     UCHAR           JoinExtIe[256];
     ULONG           JoinExtIeLen;
     USHORT          JoinAid, JoinStatus, JoinCap, LossReason;
@@ -992,6 +992,7 @@ static NTSTATUS Rtl_Bw40Apply(PDEVICE_CONTEXT c, UCHAR primary, BOOLEAN minus)
     if (!minus) CHK(Rtl_Write8(c, 0x0442, 0x28));
     CHK(Rtl_Write32(c, 0x0840, 0x01800400u | center));                  /* RF 0x18: BW40 | centre channel */
     c->Bw40Primary = primary; c->Bw40Minus = minus ? 1 : 0; c->Bw40Center = center;
+    c->TxSc40 = (UCHAR)(RegGetUlong(c->Device, L"Cfg_TxSc", 1) & 0xF);
     InterlockedExchange(&c->Bw40Active, 1);
     return STATUS_SUCCESS;
 }
@@ -1393,8 +1394,8 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
         if (dm & 2)  w[2] = 0x00701000u;                                   /* AGG_EN + AMPDU density 7, no AGG_BREAK / antenna bits */
         /* DATA_BW 40 only where the descriptor was captured (secondary below). With secondary above the TX sub-channel
          * field is unknown: send at 20 MHz on the primary channel (valid in an HT40 BSS), receive stays 40 MHz. */
-        BOOLEAN bw40tx = (BOOLEAN)(c->Bw40Active && c->Bw40Minus);
-        if ((dm & 4) && bw40tx) w[4] |= 0x02000000u;                       /* DATA_BW 40 */
+        BOOLEAN bw40tx = (BOOLEAN)(c->Bw40Active && (c->Bw40Minus || c->TxSc40 != 0xF));
+        if ((dm & 4) && bw40tx) w[4] |= 0x02000000u | (c->Bw40Minus ? 0u : ((ULONG)(c->TxSc40 & 3) << 20));   /* DATA_BW 40 + DATA_SC (plus case) */
         if (dm & 32) w[4] = 0x00000908u | (bw40tx && (dm & 4) ? 0x02000000u : 0);   /* RTS rate 24M, CTS-self */
         if ((dm & 8) && rate >= 12) w[5] |= 0x40u;                         /* SGI for MCS rates */
         if (dm & 16) { w[6] = 0x6666F800u; w[7] = 0; }                     /* rate fallback table */

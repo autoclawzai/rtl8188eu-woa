@@ -992,7 +992,7 @@ static NTSTATUS Rtl_Bw40Apply(PDEVICE_CONTEXT c, UCHAR primary, BOOLEAN minus)
     if (!minus) CHK(Rtl_Write8(c, 0x0442, 0x28));
     CHK(Rtl_Write32(c, 0x0840, 0x01800400u | center));                  /* RF 0x18: BW40 | centre channel */
     c->Bw40Primary = primary; c->Bw40Minus = minus ? 1 : 0; c->Bw40Center = center;
-    c->TxSc40 = (UCHAR)(RegGetUlong(c->Self, L"Cfg_TxSc", 1) & 0xF);
+    c->TxSc40 = (UCHAR)(RegGetUlong(c->Self, L"Cfg_TxSc", 15) & 0xF);
     InterlockedExchange(&c->Bw40Active, 1);
     return STATUS_SUCCESS;
 }

@@ -1386,8 +1386,11 @@ static NTSTATUS Tx_Raw(PDEVICE_CONTEXT c, const UCHAR *frame, ULONG fl, BOOLEAN 
     if (real) {   /* pieces of the data descriptor seen from the real Realtek driver, selectable via Cfg_DescMask */
         if (dm & 1)  { w[1] |= 0x08000000u; RtlZeroMemory(b + TXDESC_LEN, 16); }
         if (dm & 2)  w[2] = 0x00701000u;                                   /* AGG_EN + AMPDU density 7, no AGG_BREAK / antenna bits */
-        if ((dm & 4) && c->Bw40Active) w[4] |= 0x02000000u;                /* DATA_BW 40 */
-        if (dm & 32) w[4] = 0x00000908u | (c->Bw40Active && (dm & 4) ? 0x02000000u : 0);   /* RTS rate 24M, CTS-self */
+        /* DATA_BW 40 only where the descriptor was captured (secondary below). With secondary above the TX sub-channel
+         * field is unknown: send at 20 MHz on the primary channel (valid in an HT40 BSS), receive stays 40 MHz. */
+        BOOLEAN bw40tx = (BOOLEAN)(c->Bw40Active && c->Bw40Minus);
+        if ((dm & 4) && bw40tx) w[4] |= 0x02000000u;                       /* DATA_BW 40 */
+        if (dm & 32) w[4] = 0x00000908u | (bw40tx && (dm & 4) ? 0x02000000u : 0);   /* RTS rate 24M, CTS-self */
         if ((dm & 8) && rate >= 12) w[5] |= 0x40u;                         /* SGI for MCS rates */
         if (dm & 16) { w[6] = 0x6666F800u; w[7] = 0; }                     /* rate fallback table */
     }

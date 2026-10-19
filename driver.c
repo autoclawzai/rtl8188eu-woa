@@ -1862,7 +1862,7 @@ static NTSTATUS Join_Run(WDFDEVICE dev, PDEVICE_CONTEXT c)
          * Stay at 20 MHz there unless explicitly enabled (Cfg_Ht40Plus=1) for experiments. */
         if (sec == 1) {
             /* HT40+: join (auth/assoc) at 20 MHz like the real driver, switch to 40 MHz only once associated */
-            if (RegGetUlong(dev, L"Cfg_Ht40Plus", 0)) {
+            if (RegGetUlong(dev, L"Cfg_Ht40Plus", 1)) {
                 c->Bw40Primary = c->JoinCh; c->Bw40Minus = 0; c->Bw40Center = (UCHAR)(c->JoinCh + 2);
                 InterlockedExchange(&c->Bw40Want, 1);
                 RegLog(dev, L"Log_Ht40_PlusDeferred", 1);

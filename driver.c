@@ -971,6 +971,7 @@ static NTSTATUS Rtl_Bw20Restore(PDEVICE_CONTEXT c)
     CHK(Rtl_Write32(c, 0x0A00, 0x00D047C8u));
     CHK(Rtl_Write32(c, 0x0D00, 0x00000740u));
     CHK(Rtl_Write32(c, 0x0818, 0x02200385u));
+    CHK(Rtl_Write8 (c, 0x0442, 0x08));                  /* RRSR+2 as written at init (0x0008015F) */
     InterlockedExchange(&c->Bw40Active, 0);
     return STATUS_SUCCESS;
 }
@@ -984,7 +985,11 @@ static NTSTATUS Rtl_Bw40Apply(PDEVICE_CONTEXT c, UCHAR primary, BOOLEAN minus)
     CHK(Rtl_Write32(c, 0x0900, 0x00000001u));
     CHK(Rtl_Write32(c, 0x0A00, minus ? 0x00D047D8u : 0x00D047C8u));   /* CCK side band (plus case not seen in the capture) */
     CHK(Rtl_Write32(c, 0x0D00, minus ? 0x00000B40u : 0x00000740u));   /* OFDM primary channel field */
-    CHK(Rtl_Write32(c, 0x0818, 0x06200385u));
+    /* 0x818 bits 27:26 = sub-channel selector (Linux phy_set_bw_mode_callback): 2 when the primary is the LOWER
+     * 20 MHz (secondary above), 1 otherwise. The capture only had the "below" case (0x06200385). */
+    CHK(Rtl_Write32(c, 0x0818, minus ? 0x06200385u : 0x0A200385u));
+    /* REG_RRSR+2 bits 6:5 = prime SC << 5 (LOWER=1, UPPER=2); the captured "below" case needs no change */
+    if (!minus) CHK(Rtl_Write8(c, 0x0442, 0x28));
     CHK(Rtl_Write32(c, 0x0840, 0x01800400u | center));                  /* RF 0x18: BW40 | centre channel */
     c->Bw40Primary = primary; c->Bw40Minus = minus ? 1 : 0; c->Bw40Center = center;
     InterlockedExchange(&c->Bw40Active, 1);

@@ -2739,6 +2739,39 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     return STATUS_SUCCESS;
 }
 
+/* Shutdown/restart: WlanSvc keeps a WifiCx handle open and NDIS waits for it at S5 (0x9F). Failing the device here
+ * makes PnP remove the interface like Disable-NetAdapter does, which makes WlanSvc close its handle.
+ * WDF only offers shutdown notification for control devices, so a tiny control device carries it. */
+static WDFDEVICE g_MainDev;
+static WDFDEVICE g_CtlDev;
+
+VOID EvtDeviceShutdownNotification(WDFDEVICE ctl)
+{
+    WDFDEVICE dev = g_MainDev;
+    UNREFERENCED_PARAMETER(ctl);
+    if (!dev) return;
+    WifiCx_Trace(dev, 0x1010);
+    RegLog(dev, L"Log_ShutdownNotify", 1);
+    WdfDeviceSetFailed(dev, WdfDeviceFailedNoRestart);
+}
+
+static VOID EvtMainCleanup(WDFOBJECT o) { if ((WDFDEVICE)o == g_MainDev) g_MainDev = NULL; }
+
+static VOID CreateShutdownControlDevice(WDFDEVICE main)
+{
+    PWDFDEVICE_INIT ci;
+    WDF_OBJECT_ATTRIBUTES a;
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    g_MainDev = main;
+    if (g_CtlDev) return;
+    ci = WdfControlDeviceInitAllocate(WdfGetDriver(), &sddl);
+    if (!ci) return;
+    WdfControlDeviceInitSetShutdownNotification(ci, EvtDeviceShutdownNotification, WdfDeviceShutdown);
+    WDF_OBJECT_ATTRIBUTES_INIT(&a);
+    if (NT_SUCCESS(WdfDeviceCreate(&ci, &a, &g_CtlDev))) WdfControlFinishInitializing(g_CtlDev);
+    else WdfDeviceInitFree(ci);
+}
+
 /* Runs before WifiCx deletes the port types (EvtCxDevicePostSelfManagedIoSuspendEx): bring the whole
  * driver to a quiet state so NetAdapterCx can stop the adapter without waiting on us. */
 NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)

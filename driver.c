@@ -240,6 +240,7 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE EvtDevicePrepareHardware;
 EVT_WDF_DEVICE_D0_ENTRY EvtDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT EvtDeviceD0Exit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND EvtDeviceSelfManagedIoSuspend;
+EVT_WDF_DEVICE_SHUTDOWN_NOTIFICATION EvtDeviceShutdownNotification;
 EVT_WDF_USB_READER_COMPLETION_ROUTINE EvtUsbRxComplete;
 EVT_WDF_USB_READERS_FAILED EvtUsbReadersFailed;
 EVT_WDF_TIMER EvtScanTimer;
@@ -2472,6 +2473,7 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
     pnp.EvtDeviceD0Entry = EvtDeviceD0Entry;
     pnp.EvtDeviceD0Exit  = EvtDeviceD0Exit;
     pnp.EvtDeviceSelfManagedIoSuspend = EvtDeviceSelfManagedIoSuspend;
+    WdfDeviceInitRegisterShutdownNotification(init, EvtDeviceShutdownNotification, WdfDeviceShutdown);
     WdfDeviceInitSetPnpPowerEventCallbacks(init, &pnp);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, DEVICE_CONTEXT);

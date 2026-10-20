@@ -2369,7 +2369,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
 
 ULONG Rtl_CfgLinkState(WDFDEVICE dev)
 {
-    return RegGetUlong(dev, L"Cfg_LinkState", 0);
+    return RegGetUlong(dev, L"Cfg_LinkState", 1);
 }
 
 VOID Rtl_WifiDisconnect(WDFDEVICE dev)

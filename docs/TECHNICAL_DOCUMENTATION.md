@@ -116,7 +116,7 @@ USB bulk-IN continuous reader → parse RX descriptors/PHY status (RSSI: `pwdb_a
 BW40 registers, HT capability IE in assoc request, restored on scan/disconnect (`Ht40Cfg`, `Bw40Active`).
 
 ### 3.8 Registry knobs (`HKLM\SYSTEM\CurrentControlSet\Enum\USB\VID_2357&PID_010C\...\Device Parameters`)
-`Cfg_Ba`=1 (accept AP ADDBA), `Cfg_DescMask`=0x1C, `Cfg_EapolLow`=1, `Cfg_Ht40`=1, `Cfg_LinkState`=0 (mirror link state into NetAdapter; **1 caused long no-internet**), `Cfg_QosTx`=0, `Cfg_RxNative`=1, `Cfg_SelfTest`=0, `Cfg_TxAgg`=0 / `Cfg_TxAggPos`=0 (USB TX aggregation, off), `Cfg_TxAmpdu`=1, `Cfg_TxAsync`=1, `Cfg_TxMode`=0, `Cfg_TxRate`=auto.
+`Cfg_Ba`=1 (accept AP ADDBA), `Cfg_DescMask`=0x1C, `Cfg_EapolLow`=1, `Cfg_Ht40`=1, `Cfg_LinkState`=1 (mirror link state into NetAdapter; default since Oct 21: with 0 the NDIS datapath stays DIVERTED_BECAUSE_MEDIA_DISCONNECTED after the first disconnect, queues are never recreated and every reconnect fails at M2; the old "long no-internet" with 1 predates the NeedPtk gate), `Cfg_QosTx`=0, `Cfg_RxNative`=1, `Cfg_SelfTest`=0, `Cfg_TxAgg`=0 / `Cfg_TxAggPos`=0 (USB TX aggregation, off), `Cfg_TxAmpdu`=1, `Cfg_TxAsync`=1, `Cfg_TxMode`=0, `Cfg_TxRate`=auto.
 Logs: `Log_Join_*`, `Log_Key_*`, `Log_Dp_*` (data path: TxQCreated/RxQCreated, TxAdv, RxAdv, RxArm, RxNotify, RxRingDrop, queue cancel counters), `Log_Data_*`, `Log_Rate_*`, `Log_TxAmpdu_*`, `Log_D0Entry_*`, `Log_Eapol_N/T##/I##` (128-entry EAPOL ring).
 
 ---------------------------------------------------------------------------------------------------
@@ -204,6 +204,6 @@ Hidden SSID support; remove diagnostic code (EAPOL ring, Dbg logs, `Cfg_LinkStat
 - `raw.githubusercontent.com` caches ~5 min; PowerShell one-liners break on nested quotes; Cloudflare blocks default curl UA; `Invoke-WebRequest` progress bar throttles downloads (`$ProgressPreference='SilentlyContinue'`).
 - Sandbox (where the AI works) cannot reach the user's LAN or speed servers: all measurements come from the user's machine.
 - Test-signing: `bcdedit /set testsigning on`, certificate into **Root and TrustedPublisher**; `update.ps1` does it.
-- Do not use `Cfg_LinkState=1`; do not enable `Cfg_TxAgg` (USB TX aggregation) without a reason (no gain measured).
+- Keep `Cfg_LinkState=1` (do not set 0); do not enable `Cfg_TxAgg` (USB TX aggregation) without a reason (no gain measured).
 - The adapter is 2.4 GHz only, 1T1R: ~38 Mbps TCP is close to what the real driver gets on this hardware.
 - Original README mentions a Nabu (Snapdragon) target; current test machine is a **Raspberry Pi 400**.

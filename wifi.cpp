@@ -85,6 +85,7 @@ typedef struct _WIFI_CTX {
     volatile LONG ConnPending;      /* a WDI connect task waits for its M4 */
     WDI_MESSAGE_HEADER ConnHdr;
     volatile LONG DiscPending;
+    volatile LONG Quiesced;         /* power-down: new scan/connect are refused, disconnect completes at once */
     WDI_MESSAGE_HEADER DiscHdr;
     UCHAR       Bssid[6];
     BOOLEAN     Connected;
@@ -266,7 +267,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
     case WDI_TASK_SCAN: {
         WLog(Device, L"Log_Wifi_ScanTasks", (ULONG)InterlockedIncrement(&ctx->ScanTaskCount));
         /* 5c: SSID/channel filters are ignored for now, we always scan all 13 channels */
-        if (InterlockedCompareExchange(&ctx->ScanPending, 1, 0) != 0) {
+        if (ctx->Quiesced || InterlockedCompareExchange(&ctx->ScanPending, 1, 0) != 0) {
             WifiRequestComplete(Request, STATUS_INVALID_DEVICE_STATE, sizeof(WDI_MESSAGE_HEADER));
             return;
         }
@@ -290,7 +291,7 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
             return;
         }
         WLog(Device, L"Log_Wifi_ConnTasks", (ULONG)InterlockedIncrement(&ctx->ConnTaskCount));
-        if (p.PreferredBSSEntryList.ElementCount == 0 ||
+        if (ctx->Quiesced || p.PreferredBSSEntryList.ElementCount == 0 ||
             InterlockedCompareExchange(&ctx->ConnPending, 1, 0) != 0) {
             WLog(Device, L"Log_Wifi_ConnRej", (ULONG)InterlockedIncrement(&ctx->ConnRejCount));
             CleanupParsedWdiTaskConnectToIhv(&p);
@@ -371,6 +372,11 @@ static VOID EvtWifiDeviceSendCommand(WDFDEVICE Device, WIFIREQUEST Request)
     case WDI_TASK_DISCONNECT:
         WLog(Device, L"Log_Wifi_DiscTasks", (ULONG)InterlockedIncrement(&ctx->DiscTaskCount));
         WifiRequestComplete(Request, STATUS_SUCCESS, sizeof(WDI_MESSAGE_HEADER));      /* M3 */
+        if (ctx->Quiesced) {                              /* power-down: nothing to tear down, WlanSvc must get its M4 now or it never lets go */
+            Trace(ctx, 0x1020);
+            SendM4(Device, WDI_INDICATION_DISCONNECT_COMPLETE, hdr, STATUS_SUCCESS);
+            return;
+        }
         ctx->DiscHdr = hdr;
         InterlockedExchange(&ctx->DiscPending, 1);
         Rtl_WifiDisconnect(Device);                       /* M4 comes from WifiCx_OnDisconnectDone */
@@ -631,9 +637,15 @@ extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
 /* Power-down quiesce: called from EvtDeviceSelfManagedIoSuspend, i.e. BEFORE WifiCx tears the port
  * types down. Every outstanding WDI task must be completed (M4) so nothing in the OS (WlanSvc/WcmSvc)
  * keeps waiting on this adapter while NetAdapterCx stops it. */
+extern "C" VOID WifiCx_Unquiesce(WDFDEVICE Device)
+{
+    InterlockedExchange(&GetWifiCtx(Device)->Quiesced, 0);
+}
+
 extern "C" VOID WifiCx_Quiesce(WDFDEVICE Device)
 {
     PWIFI_CTX ctx = GetWifiCtx(Device);
+    InterlockedExchange(&ctx->Quiesced, 1);
     if (InterlockedCompareExchange(&ctx->ConnPending, 0, 1) == 1)
         SendM4(Device, WDI_INDICATION_CONNECT_COMPLETE, ctx->ConnHdr, STATUS_CANCELLED);
     if (InterlockedCompareExchange(&ctx->ScanPending, 0, 1) == 1)

@@ -2681,6 +2681,7 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     RegLog(dev, L"Log_D0Entry_Prev", (ULONG)prev);
     InterlockedExchange(&ctx->HwReady, 0);
     InterlockedExchange(&ctx->Stopping, 0);
+    WifiCx_Unquiesce(dev);
     InterlockedExchange(&ctx->JoinState, 0);
 
     st = Rtl_PowerOn(ctx);

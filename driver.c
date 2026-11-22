@@ -1725,6 +1725,7 @@ NTSTATUS Rtl_WifiKey(WDFDEVICE dev, ULONG op, BOOLEAN group, UCHAR keyId, const 
 {
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
     KEY_REQ *r;
+    WifiCx_Trace2(dev, 0x2050, (op << 8) | (group ? 1 : 0) | ((ULONG)keyId << 16));
     WdfSpinLockAcquire(c->TxQLock);
     if (c->KeyQHead - c->KeyQTail >= KEYQ_N) { WdfSpinLockRelease(c->TxQLock); return STATUS_INSUFFICIENT_RESOURCES; }
     r = &c->KeyQ[c->KeyQHead % KEYQ_N];
@@ -1937,6 +1938,7 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
     if (job == JOB_JOIN) {
         NTSTATUS st = c->HwReady ? Join_Run(dev, c) : STATUS_DEVICE_NOT_READY;
         c->JoinRuns++;
+        WifiCx_Trace2(dev, 0x2041, (ULONG)st);
         RegLog(dev, L"Log_Join_Runs", c->JoinRuns);
         RegLog(dev, L"Log_Join_Status", (ULONG)st);
         if (!NT_SUCCESS(st)) {
@@ -1948,6 +1950,7 @@ static VOID EvtJoinWork(WDFWORKITEM wi)
                                    c->AssocReq, c->AssocReqLen, c->AssocResp, c->AssocRespLen);
     } else if (job == JOB_LEAVE) {
         UCHAR f[26];
+        WifiCx_Trace2(dev, 0x2042, (ULONG)c->JoinState);
         if (c->JoinState == JOIN_UP && c->HwReady) {
             Mgmt_Header(c, f, 0xC0);          /* deauthentication, reason 3 = leaving */
             f[24] = 3; f[25] = 0;
@@ -2053,7 +2056,15 @@ static VOID EvtStatsWork(WDFWORKITEM wi)
 {
     WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(wi);
     PDEVICE_CONTEXT c = GetDeviceContext(dev);
-    if (c->Stopping) return;
+    if (c->Stopping) {
+        /* suspend/shutdown in progress (the power IRP may hang here): keep the timeline in the registry, 2 s heartbeat */
+        WifiCx_Trace2(dev, 0x2060, 0);
+        WifiCx_FlushTimeline(dev);
+        RegLog(dev, L"Log_Hb_Ms", (ULONG)(KeQueryInterruptTime() / 10000));
+        if (c->HwReady) WdfTimerStart(c->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
+        return;
+    }
+    WifiCx_FlushTimeline(dev);
     c->TxMode = (LONG)RegGetUlong(dev, L"Cfg_TxMode", 0);
     c->TxRate = (LONG)RegGetUlong(dev, L"Cfg_TxRate", TXD_RATE_DATA);
     RegLog(dev, L"Log_TxMode_Active", (ULONG)c->TxMode);
@@ -2193,6 +2204,7 @@ static VOID EvtTxWork(WDFWORKITEM wi)
 static VOID Eapol_Note(PDEVICE_CONTEXT c, BOOLEAN rx, const UCHAR *x)
 {
     LONG n = InterlockedIncrement(&c->EapolN) - 1;
+    WifiCx_Trace2(c->Self, rx ? 0x2030 : 0x2031, (ULONG)((x[1] == 3 ? (((ULONG)x[5] << 8) | x[6]) : 0xFFFFu)));
     ULONG ki = (x[1] == 3) ? (((ULONG)x[5] << 8) | x[6]) : 0xFFFFu;
     c->EapolT[n % 128] = (ULONG)(KeQueryInterruptTime() / 10000);
     c->EapolI[n % 128] = (rx ? 0x80000000u : 0) | (ki << 8) | x[16];
@@ -2362,6 +2374,7 @@ NTSTATUS Rtl_WifiConnect(WDFDEVICE dev, const UCHAR *bssid, const UCHAR *ssid, U
     c->TxQTail = c->TxQHead;                       /* drop anything stale */
     WdfSpinLockRelease(c->TxQLock);
     WifiCx_ResetRx(dev);                           /* no stale frames from the previous session */
+    WifiCx_Trace2(dev, 0x2040, ch);
     c->JoinJob = JOB_JOIN;
     WdfWorkItemEnqueue(c->JoinWork);
     return STATUS_SUCCESS;
@@ -2571,6 +2584,7 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER drv, PWDFDEVICE_INIT init)
 NTSTATUS EvtDevicePrepareHardware(WDFDEVICE dev, WDFCMRESLIST res, WDFCMRESLIST resTr)
 {
     PDEVICE_CONTEXT ctx = GetDeviceContext(dev);
+    WifiCx_Trace2(dev, 0x1100, 0);
     WDF_USB_DEVICE_CREATE_CONFIG ucfg;
     WDF_USB_DEVICE_SELECT_CONFIG_PARAMS sel;
     WDF_USB_CONTINUOUS_READER_CONFIG rcfg;
@@ -2677,6 +2691,7 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     UNREFERENCED_PARAMETER(prev);
 
     ctx->D0Count++;
+    WifiCx_Trace2(dev, 0x1101, (ULONG)prev);
     RegLog(dev, L"Log_D0Entry_Count", ctx->D0Count);
     RegLog(dev, L"Log_D0Entry_Prev", (ULONG)prev);
     InterlockedExchange(&ctx->HwReady, 0);
@@ -2697,6 +2712,7 @@ NTSTATUS EvtDeviceD0Entry(WDFDEVICE dev, WDF_POWER_DEVICE_STATE prev)
     RegLog(dev, L"Log_Stage", 8);   /* firmware running (WINTINI_RDY) */
 
     st = Rtl_ReplayInit(ctx, &initDone);
+    WifiCx_Trace2(dev, 0x1102, (ULONG)st);
     RegLog(dev, L"Log_Init_Status", (ULONG)st);
     RegLog(dev, L"Log_Init_Done", initDone);
     if (!NT_SUCCESS(st)) return STATUS_SUCCESS;
@@ -2753,7 +2769,10 @@ VOID EvtDeviceShutdownNotification(WDFDEVICE ctl)
     if (!dev) return;
     WifiCx_Trace(dev, 0x1010);
     RegLog(dev, L"Log_ShutdownNotify", 1);
+    WifiCx_FlushTimeline(dev);
     WdfDeviceSetFailed(dev, WdfDeviceFailedNoRestart);
+    WifiCx_Trace2(dev, 0x1011, 0);
+    WifiCx_FlushTimeline(dev);
 }
 
 static VOID EvtMainCleanup(WDFOBJECT o) { if ((WDFDEVICE)o == g_MainDev) g_MainDev = NULL; }
@@ -2790,6 +2809,9 @@ NTSTATUS EvtDeviceSelfManagedIoSuspend(WDFDEVICE dev)
     WifiCx_Quiesce(dev);
     RegLog(dev, L"Log_SelfSuspend", ctx->D0Count);
     WifiCx_Trace(dev, 0x1002);
+    WifiCx_Trace2(dev, 0x1004, (ULONG)WdfDeviceGetSystemPowerAction(dev));
+    WifiCx_FlushTimeline(dev);
+    if (ctx->HwReady) WdfTimerStart(ctx->StatsTimer, WDF_REL_TIMEOUT_IN_MS(2000));
     {
         POWER_ACTION pa = WdfDeviceGetSystemPowerAction(dev);
         if (pa == PowerActionShutdown || pa == PowerActionShutdownReset || pa == PowerActionShutdownOff) {
@@ -2817,6 +2839,8 @@ NTSTATUS EvtDeviceD0Exit(WDFDEVICE dev, WDF_POWER_DEVICE_STATE target)
     InterlockedExchange(&ctx->ScanCancel, 1);
     InterlockedExchange(&ctx->HwReady, 0);
     WdfTimerStop(ctx->StatsTimer, TRUE);
+    WdfWorkItemFlush(ctx->StatsWork);
+    WdfTimerStop(ctx->StatsTimer, TRUE);          /* the stats work re-arms itself while Stopping (shutdown heartbeat) */
     WdfWorkItemFlush(ctx->StatsWork);
     WdfWorkItemFlush(ctx->JoinWork);
     WdfWorkItemFlush(ctx->LossWork);

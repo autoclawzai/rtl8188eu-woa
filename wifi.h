@@ -22,6 +22,8 @@ VOID  WifiCx_OnScanComplete(WDFDEVICE Device);
 VOID  WifiCx_Quiesce(WDFDEVICE Device);
 VOID  WifiCx_Unquiesce(WDFDEVICE Device);
 VOID  WifiCx_Trace(WDFDEVICE Device, ULONG Code);      /* in-memory event ring, for crash dumps */
+VOID  WifiCx_Trace2(WDFDEVICE Device, ULONG Code, ULONG Arg);   /* timeline event (any IRQL, lock-free) */
+VOID  WifiCx_FlushTimeline(WDFDEVICE Device);                   /* PASSIVE only: last events -> registry Log_Timeline */
 
 /* wifi.cpp -> driver.c */
 NTSTATUS Rtl_WifiScanRequest(WDFDEVICE Device);

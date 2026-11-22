@@ -102,6 +102,11 @@ typedef struct _WIFI_CTX {
     USHORT      RxLen[RX_RING_N];
     UCHAR       Rx[RX_RING_N][1536];
     ULONG       RxDropped;
+    /* timeline: 256 events {ms since boot, code, arg}; flushed to registry Log_Timeline and readable from a dump (TlMagic 'TLNE') */
+    ULONG       TlMagic;
+    volatile LONG TlPos;
+    ULONG       TlCode[256], TlMs[256], TlArg[256];
+    volatile LONG TxSeen, RxSeen;
 } WIFI_CTX, *PWIFI_CTX;
 
 typedef struct _QUEUE_CTX {
@@ -132,13 +137,57 @@ static VOID WLog(WDFDEVICE dev, PCWSTR name, ULONG value)
     WdfRegistryClose(key);
 }
 
+static VOID TlPush(PWIFI_CTX ctx, ULONG code, ULONG arg)
+{
+    ULONG j = (ULONG)InterlockedIncrement(&ctx->TlPos) & 255;
+    ctx->TlMagic = 0x454E4C54;
+    ctx->TlCode[j] = code;
+    ctx->TlArg[j] = arg;
+    ctx->TlMs[j] = (ULONG)(KeQueryInterruptTime() / 10000);
+}
 static VOID Trace(PWIFI_CTX ctx, ULONG code)
 {
     ULONG i = (ULONG)InterlockedIncrement(&ctx->TrPos) & 63;
     ctx->TrId[i] = code;
     ctx->TrMs[i] = (ULONG)(KeQueryInterruptTime() / 10000);
+    TlPush(ctx, code, 0);
 }
 extern "C" VOID WifiCx_Trace(WDFDEVICE Device, ULONG Code) { Trace(GetWifiCtx(Device), Code); }
+extern "C" VOID WifiCx_Trace2(WDFDEVICE Device, ULONG Code, ULONG Arg) { TlPush(GetWifiCtx(Device), Code, Arg); }
+
+/* PASSIVE_LEVEL: newest 100 timeline events as text "ms:code:arg ..." (hex, oldest first) into ...\Device Parameters\Log_Timeline.
+ * The registry still works while the power IRP hangs, so this is how a shutdown hang or a dead datapath leaves a trace without a dump. */
+extern "C" VOID WifiCx_FlushTimeline(WDFDEVICE Device)
+{
+    PWIFI_CTX ctx = GetWifiCtx(Device);
+    const ULONG N = 100;
+    const SIZE_T cap = 8192;
+    PWCHAR buf = (PWCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, cap, WIFI_POOL_TAG);
+    if (!buf) return;
+    LONG pos = ctx->TlPos;
+    size_t left = cap / sizeof(WCHAR);
+    PWCHAR w = buf;
+    buf[0] = 0;
+    for (ULONG k = 0; k < N; k++) {
+        LONG idx = pos - (LONG)(N - 1 - k);
+        if (idx < 0) continue;
+        ULONG j = (ULONG)idx & 255;
+        if (ctx->TlMs[j] == 0 && ctx->TlCode[j] == 0) continue;
+        if (!NT_SUCCESS(RtlStringCchPrintfW(w, left, L"%x:%x:%x ", ctx->TlMs[j], ctx->TlCode[j], ctx->TlArg[j]))) break;
+        size_t n = 0;
+        if (!NT_SUCCESS(RtlStringCchLengthW(w, left, &n))) break;
+        w += n; left -= n;
+    }
+    WDFKEY key;
+    UNICODE_STRING nm, val;
+    if (NT_SUCCESS(WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_WRITE, WDF_NO_OBJECT_ATTRIBUTES, &key))) {
+        RtlInitUnicodeString(&nm, L"Log_Timeline");
+        RtlInitUnicodeString(&val, buf);
+        (VOID)WdfRegistryAssignUnicodeString(key, &nm, &val);
+        WdfRegistryClose(key);
+    }
+    ExFreePoolWithTag(buf, WIFI_POOL_TAG);
+}
 
 /* ------------------------------------------------------------------ */
 /* indications                                                         */
@@ -505,6 +554,8 @@ extern "C" VOID WifiCx_OnScanComplete(WDFDEVICE Device)
 static VOID SetNetLink(WDFDEVICE Device, BOOLEAN up)
 {
     PWIFI_CTX ctx = GetWifiCtx(Device);
+    TlPush(ctx, up ? 0x2010 : 0x2011, (ULONG)g_St[ST_TX_PKT]);
+    if (up) { InterlockedExchange(&ctx->TxSeen, 0); InterlockedExchange(&ctx->RxSeen, 0); }
     if (!Rtl_CfgLinkState(Device)) return;
     NETADAPTER ad = ctx->Adapters[0];
     if (!ad) return;
@@ -618,6 +669,7 @@ extern "C" VOID WifiCx_OnLinkLost(WDFDEVICE Device, USHORT Reason)
     BOOLEAN was = ctx->Connected;
     ctx->Connected = FALSE;
     SetNetLink(Device, FALSE);
+    TlPush(ctx, 0x2043, Reason);
     WLog(Device, L"Log_Wifi_LinkLost", Reason);
     if (!was) return;
     /* unsolicited disassociation indication: Windows leaves the connected state and may reconnect */
@@ -669,6 +721,7 @@ static VOID EvtTxAdvance(NETPACKETQUEUE q)
     while (NetPacketIteratorHasAny(&pi)) {
         NET_PACKET* pkt = NetPacketIteratorGetPacket(&pi);
         InterlockedIncrement(&g_St[ST_TX_PKT]);
+        if (InterlockedCompareExchange(&qc->Wifi->TxSeen, 1, 0) == 0) TlPush(qc->Wifi, 0x2020, (ULONG)g_St[ST_TX_PKT]);
         InterlockedExchange(&g_St[ST_TX_L2], (LONG)pkt->Layout.Layer2Type);
         InterlockedExchange(&g_St[ST_TX_L2HDR], (LONG)pkt->Layout.Layer2HeaderLength);
         InterlockedExchange(&g_St[ST_TX_L3], (LONG)pkt->Layout.Layer3Type);
@@ -707,6 +760,7 @@ static VOID EvtTxNotify(NETPACKETQUEUE, BOOLEAN) {}
 static VOID EvtTxCancel(NETPACKETQUEUE q)
 {
     InterlockedIncrement(&g_St[ST_TXQ_CANCEL]);
+    TlPush(GetQueueCtx(q)->Wifi, 0x2003, (ULONG)g_St[ST_TX_PKT]);
     NET_RING_COLLECTION const* rings = NetTxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
     while (NetPacketIteratorHasAny(&pi)) {
@@ -757,6 +811,7 @@ static VOID EvtRxAdvance(NETPACKETQUEUE q)
             NetFragmentIteratorAdvance(&fi);
             NetPacketIteratorAdvance(&pi);
             InterlockedIncrement(&g_St[ST_RX_IND]);
+            if (InterlockedCompareExchange(&w->RxSeen, 1, 0) == 0) TlPush(w, 0x2021, (ULONG)g_St[ST_RX_IND]);
         } else {
             w->RxDropped++;
         }
@@ -788,6 +843,7 @@ static VOID EvtRxCancel(NETPACKETQUEUE q)
 {
     InterlockedIncrement(&g_St[ST_RXQ_CANCEL]);
     PQUEUE_CTX qc = GetQueueCtx(q);
+    TlPush(qc->Wifi, 0x2004, (ULONG)g_St[ST_RX_IND]);
     NET_RING_COLLECTION const* rings = NetRxQueueGetRingCollection(q);
     NET_RING_PACKET_ITERATOR pi = NetRingGetAllPackets(rings);
     while (NetPacketIteratorHasAny(&pi)) {
@@ -817,6 +873,7 @@ static NTSTATUS EvtCreateTxQueue(NETADAPTER, NETTXQUEUE_INIT* Init)
                              NET_FRAGMENT_EXTENSION_VIRTUAL_ADDRESS_VERSION_1, NetExtensionTypeFragment);
     NetTxQueueGetExtension(q, &query, &qc->VaExt);
     InterlockedIncrement(&g_St[ST_TXQ_CREATED]);
+    TlPush(qc->Wifi, 0x2001, (ULONG)g_St[ST_TXQ_CREATED]);
     return STATUS_SUCCESS;
 }
 
@@ -837,6 +894,7 @@ static NTSTATUS EvtCreateRxQueue(NETADAPTER, NETRXQUEUE_INIT* Init)
     NetRxQueueGetExtension(q, &query, &qc->VaExt);
     qc->Wifi->RxQueue = q;
     InterlockedIncrement(&g_St[ST_RXQ_CREATED]);
+    TlPush(qc->Wifi, 0x2002, (ULONG)g_St[ST_RXQ_CREATED]);
     return STATUS_SUCCESS;
 }
 

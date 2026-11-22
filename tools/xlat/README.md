@@ -12,6 +12,6 @@ Input (NOT in repo, vendor binary): `rtwlanu.sys` placed next to the scripts.
 
 Run: `python3 xlat.py && clang -target aarch64-linux-gnu -c poc.s -o poc.o && python3 difftest.py`
 
-Status (phase 1 done): 6569/7920 functions translate; 625/625 differential runs pass on a 679-function closed set.
+Status: phase 2 in progress. 7099/7920 functions translate (~90%); per-instruction fuzz (fuzz1.py, incl. flags, lock atomics via LL/SC, rep string ops): 18k+ runs, 0 mismatches; closed-function differential: 542 pass (8 fails = unaligned LL/SC in harness).
 Roadmap: P2 full instruction coverage, P3 ABI thunks (imports, WDF table, callbacks), P4 ARM64 PE builder + SEH,
 P5 hardware load on Pi, P6 hardening/CI, P7 second driver.

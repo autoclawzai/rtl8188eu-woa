@@ -183,6 +183,7 @@ typedef struct _DEVICE_CONTEXT {
     ULONG           KeyQHead, KeyQTail;
     volatile LONG   NeedPtk;                /* RSN join: hold back non-EAPOL data until the PTK is installed */
     volatile LONG   GateDrops;
+    volatile LONG   TxFailNote;
     volatile LONG   PtkInstalled;           /* TX encrypts data frames when set */
     BOOLEAN         SecOn;
     ULONG64         TxPn;
@@ -1247,7 +1248,14 @@ static VOID EvtTxDone(WDFREQUEST req, WDFIOTARGET tgt, PWDF_REQUEST_COMPLETION_P
     PDEVICE_CONTEXT c = (PDEVICE_CONTEXT)s->C;
     UNREFERENCED_PARAMETER(req); UNREFERENCED_PARAMETER(tgt);
     if (NT_SUCCESS(p->IoStatus.Status)) InterlockedIncrement((volatile LONG *)&c->DataTxOk);
-    else { InterlockedIncrement((volatile LONG *)&c->DataTxFail); InterlockedIncrement(&c->TxAsyncFail); }
+    else {
+        InterlockedIncrement((volatile LONG *)&c->DataTxFail); InterlockedIncrement(&c->TxAsyncFail);
+        /* USB TX stall evidence: NTSTATUS + USBD status of failed bulk-out writes go to the timeline (first 8 only, no flood) */
+        if (InterlockedIncrement(&c->TxFailNote) <= 8) {
+            WifiCx_Trace2(c->Self, 0x2070, (ULONG)p->IoStatus.Status);
+            if (p->Type == WdfRequestTypeWrite && p->Parameters.Usb.Completion) WifiCx_Trace2(c->Self, 0x2071, (ULONG)p->Parameters.Usb.Completion->UsbdStatus);
+        }
+    }
     InterlockedExchange(&s->InUse, 0);
     KeReleaseSemaphore(&c->TxSem, 0, 1, FALSE);
 }

@@ -12,6 +12,6 @@ Input (NOT in repo, vendor binary): `rtwlanu.sys` placed next to the scripts.
 
 Run: `python3 xlat.py && clang -target aarch64-linux-gnu -c poc.s -o poc.o && python3 difftest.py`
 
-Status: phase 2 in progress. 7099/7920 functions translate (~90%); per-instruction fuzz (fuzz1.py, incl. flags, lock atomics via LL/SC, rep string ops): 18k+ runs, 0 mismatches; closed-function differential: 542 pass (8 fails = unaligned LL/SC in harness).
+Status: phase 2 near done. 11053/11308 functions translate (97.7%), incl. jump tables; per-instruction fuzz 25k+ runs, 0 mismatches. Whole-driver ARM64 object assembles (all cross-function branches resolve; only imports + helpers are external).
 Roadmap: P2 full instruction coverage, P3 ABI thunks (imports, WDF table, callbacks), P4 ARM64 PE builder + SEH,
 P5 hardware load on Pi, P6 hardening/CI, P7 second driver.

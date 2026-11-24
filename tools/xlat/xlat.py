@@ -16,6 +16,7 @@ _t=[x for x in pe.sections if x.Name.startswith(b'.text')][0]
 class _R:
     def __contains__(self,v): return IB+_t.VirtualAddress<=v<IB+_t.VirtualAddress+_t.Misc_VirtualSize
 FSTART=_R()
+ENTRY=set(); ENTRYUSED=set()
 STATS={'call_int':0,'call_imp':0,'call_ind':0,'tail':0}
 class Unsup(Exception): pass
 CUR=[None]
@@ -174,24 +175,24 @@ def translate_code(code,base):
             if m in('add','sub','and','or','xor','inc','dec'):
                 if m in('inc','dec'): out+=movimm(T+'18',1,sz)
                 else:
-                    p,b_=rd(ops[1],sz,'x18'); out+=p
-                    if b_!=T+'18': out.append('mov %s18, %s'%(T,b_))
+                    p,b_=rd(ops[1],sz,'x21'); out+=p
+                    if b_!=T+'21': out.append('mov %s21, %s'%(T,b_))
                 opc={'add':'adds','inc':'adds','sub':'subs','dec':'subs','and':'ands','or':'orr','xor':'eor'}[m]
-                out+=[lb+':','ldaxr %s17, [x16]'%T,'%s %s20, %s17, %s18'%(opc,T,T,T)]
+                out+=[lb+':','ldaxr %s17, [x16]'%T,'%s %s20, %s17, %s21'%(opc,T,T,T)]
                 if m in('or','xor'): out.append('tst %s20, %s20'%(T,T))
                 out+=['stlxr w19, %s20, [x16]'%T,'cbnz w19, '+lb]
                 kind={'add':'add','inc':'incdec','sub':'sub','dec':'incdec'}.get(m,'logic')
             elif m=='xadd':
-                p,b_=rd(ops[1],sz,'x18'); out+=p
-                if b_!=T+'18': out.append('mov %s18, %s'%(T,b_))
-                out+=[lb+':','ldaxr %s17, [x16]'%T,'adds %s20, %s17, %s18'%(T,T,T),'stlxr w19, %s20, [x16]'%T,'cbnz w19, '+lb,'mov %s, %s17'%(reg(md.reg_name(ops[1].reg),sz),T)+'']
+                p,b_=rd(ops[1],sz,'x21'); out+=p
+                if b_!=T+'21': out.append('mov %s21, %s'%(T,b_))
+                out+=[lb+':','ldaxr %s17, [x16]'%T,'adds %s20, %s17, %s21'%(T,T,T),'stlxr w19, %s20, [x16]'%T,'cbnz w19, '+lb,'mov %s, %s17'%(reg(md.reg_name(ops[1].reg),sz),T)+'']
                 kind='add'
             elif m=='xchg':
                 rr=reg(md.reg_name(ops[1].reg),sz)
-                out+=['mov %s18, %s'%(T,rr),lb+':','ldaxr %s17, [x16]'%T,'stlxr w19, %s18, [x16]'%T,'cbnz w19, '+lb,'mov %s, %s17'%(rr,T)]
+                out+=['mov %s21, %s'%(T,rr),lb+':','ldaxr %s17, [x16]'%T,'stlxr w19, %s21, [x16]'%T,'cbnz w19, '+lb,'mov %s, %s17'%(rr,T)]
             else: # cmpxchg
                 src_=reg(md.reg_name(ops[1].reg),sz); acc='x0' if sz==8 else 'w0'; lf='LF%x'%i.address
-                out+=['mov %s18, %s'%(T,src_),lb+':','ldaxr %s17, [x16]'%T,'cmp %s, %s17'%(acc,T),'b.ne '+lf,'stlxr w19, %s18, [x16]'%T,'cbnz w19, '+lb,'b %s'%('LD%x'%i.address),lf+':','clrex','mov %s, %s17'%(acc,T),'LD%x:'%i.address]
+                out+=['mov %s21, %s'%(T,src_),lb+':','ldaxr %s17, [x16]'%T,'cmp %s, %s17'%(acc,T),'b.ne '+lf,'stlxr w19, %s21, [x16]'%T,'cbnz w19, '+lb,'b %s'%('LD%x'%i.address),lf+':','clrex','mov %s, %s17'%(acc,T),'LD%x:'%i.address]
                 kind='sub'
             out.append('dmb ish'); continue
         if lockp: raise Unsup('lock form')
@@ -214,6 +215,11 @@ def translate_code(code,base):
             out.append(rl+':'); continue
         if m=='jmp' and ops[0].type==X86_OP_IMM and ops[0].imm in FSTART and ops[0].imm not in addrs:
             out.append('b F%x'%(ops[0].imm-IB)); STATS['tail']+=1; continue
+        if m=='jmp' and ops[0].type in(X86_OP_REG,X86_OP_MEM):
+            o=ops[0]
+            if o.type==X86_OP_MEM and o.mem.base==X86_REG_RIP and (i.address+i.size+o.mem.disp) in IAT: out.append('b imp_%s'%IAT[i.address+i.size+o.mem.disp]); STATS['tail_imp']=STATS.get('tail_imp',0)+1
+            else: p,v=rd(o,8,'x17'); out+=p+['mov x17, %s'%v,'b __indirect_x17']; STATS['tail_ind']=STATS.get('tail_ind',0)+1
+            continue
         if m=='jmp' or m[0]=='j':
             if ops[0].type!=X86_OP_IMM or (ops[0].imm not in addrs and ops[0].imm not in FSTART): raise Unsup('branch target')
             tgt='L%x'%ops[0].imm
@@ -224,12 +230,19 @@ def translate_code(code,base):
                 else: out.append('b.%s %s'%(c,tgt))
             continue
         sz=ops[0].size if ops else 0
+        if m=='mov' and len(ops)==2 and ops[0].type==X86_OP_REG and ops[1].type==X86_OP_REG and md.reg_name(ops[1].reg)=='cr8':
+            rl='R%x'%i.address; out+=['adr x16, %s'%rl,'str x16, [x4, #-8]!','b rt_read_cr8',rl+':']
+            dr=reg(md.reg_name(ops[0].reg),8)
+            if dr!='x0': out.append('mov %s, x0'%dr)
+            continue
         if m=='mov':
             if sz not in(1,2,4,8): raise Unsup('size')
             if sz in(4,8) and ops[0].type==X86_OP_REG and ops[1].type==X86_OP_IMM:
                 out+=movimm(reg(md.reg_name(ops[0].reg),sz),ops[1].imm,sz)
             else:
                 p,v=rd(ops[1],sz,'x17'); out+=p; out+=wr(ops[0],sz,v if ops[1].type!=X86_OP_REG or sz in(1,2) else v)
+        elif m=='lea' and ops[1].type==X86_OP_MEM and ops[1].mem.base==X86_REG_RIP and sz==8 and (i.address+i.size+ops[1].mem.disp) in ENTRY:
+            out.append('adr %s, ent_F%x'%(reg(md.reg_name(ops[0].reg),8),i.address+i.size+ops[1].mem.disp-IB)); ENTRYUSED.add(i.address+i.size+ops[1].mem.disp-IB)
         elif m=='lea':
             d0=reg(md.reg_name(ops[0].reg),sz); out+=addr(ops[1]); out.append('mov %s, %s'%(d0,'x16' if sz==8 else 'w16'))
         elif m=='movzx':
@@ -246,7 +259,7 @@ def translate_code(code,base):
                 d0=reg(md.reg_name(ops[0].reg),sz); out+=['mov %s, #0'%d0,'tst %s, %s'%(d0,d0)]; kind='logic'; continue
             if sz not in(1,2,4,8): raise Unsup('size')
             wk=m not in('cmp','test')
-            pa,a_=rd(ops[0],sz,'x17'); pb,b_=rd(ops[1],sz,'x18'); out+=pa+pb
+            pa,a_=rd(ops[0],sz,'x17'); pb,b_=rd(ops[1],sz,'x21'); out+=pa+pb
             res=a_
             if sz in(1,2) or ops[0].type!=X86_OP_REG: res=('x17' if sz==8 else 'w17')
             ins={'add':'adds','sub':'subs','and':'ands','xor':'eor','or':'orr','cmp':'cmp','test':'tst'}[m]
@@ -268,7 +281,7 @@ def translate_code(code,base):
             d0=reg(md.reg_name(ops[0].reg),sz)
             if len(ops)==2: p,sx=rd(ops[1],sz,'x17'); out+=p; out.append('mul %s, %s, %s'%(d0,d0,sx))
             else:
-                p,sx=rd(ops[1],sz,'x17'); q,sy=rd(ops[2],sz,'x18'); out+=p+q; out.append('mul %s, %s, %s'%(d0,sx,sy))
+                p,sx=rd(ops[1],sz,'x17'); q,sy=rd(ops[2],sz,'x21'); out+=p+q; out.append('mul %s, %s, %s'%(d0,sx,sy))
             kind=None
         elif m.startswith('cmov') and ops[0].type==X86_OP_REG and sz in(4,8):
             d0=reg(md.reg_name(ops[0].reg),sz); p,v=rd(ops[1],sz,'x17'); out+=p; c=cond(m[4:],kind)
@@ -279,22 +292,22 @@ def translate_code(code,base):
             else: out+=addr(ops[0])+['strb w17, [x16]']
         elif m in('adc','sbb') and sz in(4,8) and ops[0].type in(X86_OP_REG,X86_OP_MEM):
             out+=needc(kind,'CF' if m=='adc' else 'NCF')
-            pa,a_=rd(ops[0],sz,'x17'); pb,b_=rd(ops[1],sz,'x18'); out+=pa+pb
+            pa,a_=rd(ops[0],sz,'x17'); pb,b_=rd(ops[1],sz,'x21'); out+=pa+pb
             res=a_ if ops[0].type==X86_OP_REG else ('x17' if sz==8 else 'w17')
             out.append('%s %s, %s, %s'%('adcs' if m=='adc' else 'sbcs',res,a_,b_)); kind='add' if m=='adc' else 'sub'
             if ops[0].type==X86_OP_MEM: out+=wr(ops[0],sz,res)
         elif m in('mul','imul') and len(ops)==1 and sz in(4,8):
-            pb,b_=rd(ops[0],sz,'x18'); out+=pb
+            pb,b_=rd(ops[0],sz,'x21'); out+=pb
             if sz==8: out+=['mov x17, x0','%s x2, x17, %s'%('umulh' if m=='mul' else 'smulh',b_),'mul x0, x17, %s'%b_]
             else: out+=['%s x17, w0, %s'%('umull' if m=='mul' else 'smull',b_),'mov w0, w17','lsr x2, x17, #32']
             kind=None
         elif m in('div','idiv') and len(ops)==1 and sz in(4,8):
-            pb,b_=rd(ops[0],sz,'x18'); out+=pb
+            pb,b_=rd(ops[0],sz,'x21'); out+=pb
             sg=(m=='idiv')
             if sz==4:
                 out+=['mov w17, w0','orr x17, x17, x2, lsl #32'] if False else ['mov w17, w0','bfi x17, x2, #32, #32']
-                out+=[('sxtw x18, %s' if sg else 'mov w18, %s')%b_]
-                out+=['%s x16, x17, x18'%('sdiv' if sg else 'udiv'),'msub x19, x16, x18, x17','mov w0, w16','mov w2, w19']
+                out+=[('sxtw x21, %s' if sg else 'mov w21, %s')%b_]
+                out+=['%s x16, x17, x21'%('sdiv' if sg else 'udiv'),'msub x19, x16, x21, x17','mov w0, w16','mov w2, w19']
             else:
                 prev=INS[INS.index(i)-1] if INS.index(i)>0 else None
                 if sg and prev is not None and prev.mnemonic=='cqo': out+=['mov x17, x0','%s x16, x17, %s'%('sdiv',b_),'msub x19, x16, %s, x17'%b_,'mov x0, x16','mov x2, x19']
@@ -310,10 +323,10 @@ def translate_code(code,base):
             res=a_ if ops[0].type==X86_OP_REG else T+'17'
             if ops[1].type==X86_OP_IMM: n=ops[1].imm&(63 if sz==8 else 31); out+=movimm(T+'18',1<<n,sz); out.append('ubfx %s19, %s, #%d, #1'%(T,a_,n))
             else:
-                nr=reg(md.reg_name(ops[1].reg),sz); out+=['mov %s18, #1'%T,'lsl %s18, %s18, %s'%(T,T,nr),'lsr %s19, %s, %s'%(T,a_,nr),'and %s19, %s19, #1'%(T,T)]
+                nr=reg(md.reg_name(ops[1].reg),sz); out+=['mov %s21, #1'%T,'lsl %s21, %s21, %s'%(T,T,nr),'lsr %s19, %s, %s'%(T,a_,nr),'and %s19, %s19, #1'%(T,T)]
             out.append('cmp %s19, #1'%T)
             opc={'bts':'orr','btr':'bic','btc':'eor'}[m]
-            out.append('%s %s, %s, %s18'%(opc,res,a_,T)); kind='bt'
+            out.append('%s %s, %s, %s21'%(opc,res,a_,T)); kind='bt'
             if ops[0].type==X86_OP_MEM: out+=wr(ops[0],sz,res)
         elif m=='movabs' and ops[0].type==X86_OP_REG and ops[1].type==X86_OP_IMM:
             out+=movimm(reg(md.reg_name(ops[0].reg),ops[0].size),ops[1].imm,ops[0].size)
@@ -335,7 +348,7 @@ def translate_code(code,base):
             elif m=='neg': out.append('negs %s, %s'%(res,a_)); kind='sub'
             else:
                 if sz in(4,8): one='#1'
-                else: out+=movimm('w18',1<<(32-8*sz),4); one='w18'
+                else: out+=movimm('w21',1<<(32-8*sz),4); one='w21'
                 out.append(('adds %s, %s, %s' if m=='inc' else 'subs %s, %s, %s')%(res,a_,one)); kind='incdec'
             if res!=a_ or sz in(1,2) or ops[0].type==X86_OP_MEM: out+=wr(ops[0],sz,res)
         elif m in('shl','shr','sar','sal') and len(ops)==2 and sz in(1,2,4,8) and (ops[1].type==X86_OP_IMM or (ops[1].type==X86_OP_REG and md.reg_name(ops[1].reg)=='cl' and sz in(4,8))):
@@ -434,6 +447,7 @@ if __name__=='__main__':
                 if q.mnemonic=='int3': break
                 e1=q.address-IB+q.size
         ext[a0]=e1
+    ENTRY.update(IB+a for a in ext)
     cand=[(a0,e1) for a0,e1 in ext.items() if 8<=e1-a0<=int(os.environ.get("MAXF","400"))]
     for s,e in cand:
         try: res[s]=translate(s,e)
